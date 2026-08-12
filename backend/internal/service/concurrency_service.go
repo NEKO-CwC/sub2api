@@ -769,3 +769,29 @@ func (s *ConcurrencyService) GetAccountConcurrencyBatch(ctx context.Context, acc
 
 	return s.cache.GetAccountConcurrencyBatch(redisCtx, accountIDs)
 }
+
+// ConfirmAccountConcurrencyBatch is the fail-closed counterpart used by
+// control-plane recovery. Unlike the admin account view, it never converts an
+// unavailable cache or a partial cache response into a zero concurrency count.
+func (s *ConcurrencyService) ConfirmAccountConcurrencyBatch(ctx context.Context, accountIDs []int64) (map[int64]int, error) {
+	if len(accountIDs) == 0 {
+		return map[int64]int{}, nil
+	}
+	if s == nil || s.cache == nil {
+		return nil, errors.New("account concurrency cache is unavailable")
+	}
+
+	redisCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	counts, err := s.cache.GetAccountConcurrencyBatch(redisCtx, accountIDs)
+	if err != nil {
+		return nil, err
+	}
+	for _, accountID := range accountIDs {
+		count, ok := counts[accountID]
+		if !ok || count < 0 {
+			return nil, errors.New("account concurrency cache returned an incomplete response")
+		}
+	}
+	return counts, nil
+}

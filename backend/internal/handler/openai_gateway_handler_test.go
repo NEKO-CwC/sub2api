@@ -2041,6 +2041,18 @@ func TestOpenAIResponses_APIKeyPassthroughPool5xxRetriesThenExhaustsMaxSwitches(
 	cfg.Default.RateMultiplier = 1
 	cfg.Security.URLAllowlist.Enabled = false
 	cfg.Gateway.MaxAccountSwitches = 1
+	var emitted map[string]any
+	panel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&emitted))
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer panel.Close()
+	cfg.Gateway.RoutingAttemptEmitter = config.GatewayRoutingAttemptEmitterConfig{
+		Enabled: true, PanelURL: panel.URL, Secret: "test-secret", Sub2APIInstanceID: 7,
+		QueueSize: 4, BatchSize: 1, FlushIntervalMS: 10, RequestTimeoutMS: 500,
+		ShutdownTimeoutMS: 1000,
+	}
 
 	accountRepo := &openAIWSFailoverHandlerAccountRepoStub{accounts: accounts}
 	upstream := &openAIHTTPPassthroughFailoverUpstream{}
@@ -2094,11 +2106,25 @@ func TestOpenAIResponses_APIKeyPassthroughPool5xxRetriesThenExhaustsMaxSwitches(
 	c.Set(string(middleware.ContextKeyUser), middleware.AuthSubject{UserID: 1703, Concurrency: 0})
 
 	h.Responses(c)
+	h.CloseRoutingAttemptEmitter()
 
 	require.Equal(t, []int64{9910, 9910, 9911}, upstream.calls())
 	require.Equal(t, http.StatusBadGateway, rec.Code)
 	require.Equal(t, "upstream_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())
 	require.Equal(t, "Upstream service temporarily unavailable", gjson.GetBytes(rec.Body.Bytes(), "error.message").String())
+	observation, ok := emitted["observation"].(map[string]any)
+	require.True(t, ok)
+	attempts, ok := observation["attempts"].([]any)
+	require.True(t, ok)
+	require.Len(t, attempts, 3)
+	require.Equal(t, []float64{9910, 9910, 9911}, []float64{
+		attempts[0].(map[string]any)["account_id"].(float64),
+		attempts[1].(map[string]any)["account_id"].(float64),
+		attempts[2].(map[string]any)["account_id"].(float64),
+	})
+	require.False(t, attempts[0].(map[string]any)["is_final"].(bool))
+	require.False(t, attempts[1].(map[string]any)["is_final"].(bool))
+	require.True(t, attempts[2].(map[string]any)["is_final"].(bool))
 }
 
 func TestOpenAIResponses_APIKeyPassthroughPoolAuthFailureRetriesThenSwitchesToHealthyAccount(t *testing.T) {
@@ -2593,6 +2619,23 @@ func TestOpenAIResponsesWebSocket_FirstOutputTimeoutWithoutDownstreamReusesClien
 	cfg.Gateway.OpenAIWS.WriteTimeoutSeconds = 3
 	cfg.Gateway.OpenAIWS.IngressInterTurnIdleTimeoutSeconds = 3
 	cfg.Gateway.MaxAccountSwitches = 3
+	routingObservationCh := make(chan map[string]any, 1)
+	routingPanel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		routingObservationCh <- payload
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer routingPanel.Close()
+	cfg.Gateway.RoutingAttemptEmitter = config.GatewayRoutingAttemptEmitterConfig{
+		Enabled: true, PanelURL: routingPanel.URL, Secret: "test-secret", Sub2APIInstanceID: 7,
+		QueueSize: 1, BatchSize: 1, FlushIntervalMS: 10, RequestTimeoutMS: 500,
+		ShutdownTimeoutMS: 1000,
+	}
 
 	accountRepo := &openAIWSFailoverHandlerAccountRepoStub{accounts: accounts}
 	rateLimitSvc := service.NewRateLimitService(accountRepo, nil, cfg, nil, nil)
@@ -2609,12 +2652,14 @@ func TestOpenAIResponsesWebSocket_FirstOutputTimeoutWithoutDownstreamReusesClien
 		},
 	}
 	h := &OpenAIGatewayHandler{
-		gatewayService:      gatewaySvc,
-		billingCacheService: billingCacheSvc,
-		apiKeyService:       &service.APIKeyService{},
-		concurrencyHelper:   NewConcurrencyHelper(service.NewConcurrencyService(cache), SSEPingFormatNone, time.Second),
-		maxAccountSwitches:  3,
+		gatewayService:        gatewaySvc,
+		billingCacheService:   billingCacheSvc,
+		apiKeyService:         &service.APIKeyService{},
+		concurrencyHelper:     NewConcurrencyHelper(service.NewConcurrencyService(cache), SSEPingFormatNone, time.Second),
+		maxAccountSwitches:    3,
+		routingAttemptEmitter: NewRoutingAttemptEmitter(cfg.Gateway.RoutingAttemptEmitter),
 	}
+	defer h.CloseRoutingAttemptEmitter()
 
 	apiKey := &service.APIKey{
 		ID:      1812,
@@ -2685,6 +2730,28 @@ func TestOpenAIResponsesWebSocket_FirstOutputTimeoutWithoutDownstreamReusesClien
 	require.Equal(t, int32(1), firstConnections.Load())
 	require.Equal(t, int32(1), secondConnections.Load())
 	require.NotContains(t, accountRepo.rateLimitedIDs, int64(9913), "healthy failover account must not be penalized")
+	h.CloseRoutingAttemptEmitter()
+	var routingObservation map[string]any
+	select {
+	case routingObservation = <-routingObservationCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("waiting for websocket failover routing evidence timed out")
+	}
+	observation, ok := routingObservation["observation"].(map[string]any)
+	require.True(t, ok)
+	attempts, ok := observation["attempts"].([]any)
+	require.True(t, ok)
+	require.Len(t, attempts, 2)
+	require.Equal(t, float64(9912), attempts[0].(map[string]any)["account_id"])
+	require.Equal(t, "failure", attempts[0].(map[string]any)["outcome"])
+	require.False(t, attempts[0].(map[string]any)["is_final"].(bool))
+	require.Equal(t, float64(9913), attempts[1].(map[string]any)["account_id"])
+	require.Equal(t, "success", attempts[1].(map[string]any)["outcome"])
+	require.True(t, attempts[1].(map[string]any)["is_final"].(bool))
+	require.Equal(t,
+		attempts[0].(map[string]any)["logical_request_id"],
+		attempts[1].(map[string]any)["logical_request_id"],
+	)
 }
 
 func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSUsageLogCase) openAIResponsesWSUsageLogResult {

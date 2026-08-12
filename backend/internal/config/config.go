@@ -1013,6 +1013,9 @@ type GatewayConfig struct {
 
 	// UsageRecord: 使用量记录异步队列配置（有界队列 + 固定 worker）
 	UsageRecord GatewayUsageRecordConfig `mapstructure:"usage_record"`
+	// RoutingAttemptEmitter is optional, additive evidence for the Panel.
+	// It is disabled by default and failures never affect request forwarding.
+	RoutingAttemptEmitter GatewayRoutingAttemptEmitterConfig `mapstructure:"routing_attempt_emitter"`
 
 	// UserGroupRateCacheTTLSeconds: 用户分组倍率热路径缓存 TTL（秒）
 	UserGroupRateCacheTTLSeconds int `mapstructure:"user_group_rate_cache_ttl_seconds"`
@@ -1026,6 +1029,28 @@ type GatewayConfig struct {
 	// Grok: Grok/xAI gateway scheduling and free-tier soft-gate settings.
 	Grok GatewayGrokConfig `mapstructure:"grok"`
 }
+
+// GatewayRoutingAttemptEmitterConfig reports gateway facts while routing
+// policy remains owned by the Panel.
+type GatewayRoutingAttemptEmitterConfig struct {
+	Enabled           bool   `mapstructure:"enabled"`
+	PanelURL          string `mapstructure:"panel_url"`
+	Secret            string `mapstructure:"secret"`
+	Sub2APIInstanceID int64  `mapstructure:"sub2api_instance_id"`
+	QueueSize         int    `mapstructure:"queue_size"`
+	BatchSize         int    `mapstructure:"batch_size"`
+	FlushIntervalMS   int    `mapstructure:"flush_interval_ms"`
+	RequestTimeoutMS  int    `mapstructure:"request_timeout_ms"`
+	ShutdownTimeoutMS int    `mapstructure:"shutdown_timeout_ms"`
+}
+
+const (
+	GatewayRoutingAttemptEmitterMaxQueueSize         = 16_384
+	GatewayRoutingAttemptEmitterMaxBatchSize         = 256
+	GatewayRoutingAttemptEmitterMaxFlushIntervalMS   = 60_000
+	GatewayRoutingAttemptEmitterMaxRequestTimeoutMS  = 10_000
+	GatewayRoutingAttemptEmitterMaxShutdownTimeoutMS = 30_000
+)
 
 // GatewayGrokConfig holds Grok-specific gateway scheduling knobs.
 //
@@ -2415,6 +2440,15 @@ func setDefaults() {
 	viper.SetDefault("gateway.usage_record.auto_scale_down_step", 16)
 	viper.SetDefault("gateway.usage_record.auto_scale_check_interval_seconds", 3)
 	viper.SetDefault("gateway.usage_record.auto_scale_cooldown_seconds", 10)
+	viper.SetDefault("gateway.routing_attempt_emitter.enabled", false)
+	viper.SetDefault("gateway.routing_attempt_emitter.panel_url", "")
+	viper.SetDefault("gateway.routing_attempt_emitter.secret", "")
+	viper.SetDefault("gateway.routing_attempt_emitter.sub2api_instance_id", 0)
+	viper.SetDefault("gateway.routing_attempt_emitter.queue_size", 256)
+	viper.SetDefault("gateway.routing_attempt_emitter.batch_size", 32)
+	viper.SetDefault("gateway.routing_attempt_emitter.flush_interval_ms", 250)
+	viper.SetDefault("gateway.routing_attempt_emitter.request_timeout_ms", 1000)
+	viper.SetDefault("gateway.routing_attempt_emitter.shutdown_timeout_ms", 5000)
 	viper.SetDefault("gateway.user_group_rate_cache_ttl_seconds", 30)
 	viper.SetDefault("gateway.models_list_cache_ttl_seconds", 15)
 	// TLS指纹伪装配置（默认关闭，需要账号级别单独启用）
@@ -3427,6 +3461,26 @@ func (c *Config) Validate() error {
 	}
 	if c.Gateway.UsageRecord.WorkerCount <= 0 {
 		return fmt.Errorf("gateway.usage_record.worker_count must be positive")
+	}
+	if c.Gateway.RoutingAttemptEmitter.QueueSize <= 0 || c.Gateway.RoutingAttemptEmitter.QueueSize > GatewayRoutingAttemptEmitterMaxQueueSize {
+		return fmt.Errorf("gateway.routing_attempt_emitter.queue_size must be between 1 and %d", GatewayRoutingAttemptEmitterMaxQueueSize)
+	}
+	if c.Gateway.RoutingAttemptEmitter.BatchSize <= 0 || c.Gateway.RoutingAttemptEmitter.BatchSize > c.Gateway.RoutingAttemptEmitter.QueueSize || c.Gateway.RoutingAttemptEmitter.BatchSize > GatewayRoutingAttemptEmitterMaxBatchSize {
+		return fmt.Errorf("gateway.routing_attempt_emitter.batch_size must be between 1 and min(queue_size, %d)", GatewayRoutingAttemptEmitterMaxBatchSize)
+	}
+	if c.Gateway.RoutingAttemptEmitter.FlushIntervalMS <= 0 || c.Gateway.RoutingAttemptEmitter.FlushIntervalMS > GatewayRoutingAttemptEmitterMaxFlushIntervalMS {
+		return fmt.Errorf("gateway.routing_attempt_emitter.flush_interval_ms must be between 1 and %d", GatewayRoutingAttemptEmitterMaxFlushIntervalMS)
+	}
+	if c.Gateway.RoutingAttemptEmitter.RequestTimeoutMS <= 0 || c.Gateway.RoutingAttemptEmitter.RequestTimeoutMS > GatewayRoutingAttemptEmitterMaxRequestTimeoutMS {
+		return fmt.Errorf("gateway.routing_attempt_emitter.request_timeout_ms must be between 1 and %d", GatewayRoutingAttemptEmitterMaxRequestTimeoutMS)
+	}
+	if c.Gateway.RoutingAttemptEmitter.ShutdownTimeoutMS <= 0 || c.Gateway.RoutingAttemptEmitter.ShutdownTimeoutMS > GatewayRoutingAttemptEmitterMaxShutdownTimeoutMS {
+		return fmt.Errorf("gateway.routing_attempt_emitter.shutdown_timeout_ms must be between 1 and %d", GatewayRoutingAttemptEmitterMaxShutdownTimeoutMS)
+	}
+	if c.Gateway.RoutingAttemptEmitter.Enabled {
+		if strings.TrimSpace(c.Gateway.RoutingAttemptEmitter.PanelURL) == "" || strings.TrimSpace(c.Gateway.RoutingAttemptEmitter.Secret) == "" || c.Gateway.RoutingAttemptEmitter.Sub2APIInstanceID <= 0 {
+			return fmt.Errorf("gateway.routing_attempt_emitter requires panel_url, secret, and positive sub2api_instance_id when enabled")
+		}
 	}
 	if c.Gateway.UsageRecord.QueueSize <= 0 {
 		return fmt.Errorf("gateway.usage_record.queue_size must be positive")

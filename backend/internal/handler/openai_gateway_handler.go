@@ -43,6 +43,7 @@ type OpenAIGatewayHandler struct {
 	imageLimiter               *imageConcurrencyLimiter
 	maxAccountSwitches         int
 	cfg                        *config.Config
+	routingAttemptEmitter      *RoutingAttemptEmitter
 }
 
 type openAIWSTurnChannelMappingSnapshot struct {
@@ -228,6 +229,20 @@ func NewOpenAIGatewayHandler(
 		imageLimiter:             &imageConcurrencyLimiter{},
 		maxAccountSwitches:       maxAccountSwitches,
 		cfg:                      cfg,
+		routingAttemptEmitter:    NewRoutingAttemptEmitter(gatewayRoutingAttemptEmitterConfig(cfg)),
+	}
+}
+
+func gatewayRoutingAttemptEmitterConfig(cfg *config.Config) config.GatewayRoutingAttemptEmitterConfig {
+	if cfg == nil {
+		return config.GatewayRoutingAttemptEmitterConfig{}
+	}
+	return cfg.Gateway.RoutingAttemptEmitter
+}
+
+func (h *OpenAIGatewayHandler) CloseRoutingAttemptEmitter() {
+	if h != nil && h.routingAttemptEmitter != nil {
+		h.routingAttemptEmitter.Close()
 	}
 }
 
@@ -431,6 +446,12 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	var lastFailoverErr *service.UpstreamFailoverError
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
 	var passthroughFailoverState openAIPassthroughFailoverState
+	groupID := int64(0)
+	if apiKey.GroupID != nil {
+		groupID = *apiKey.GroupID
+	}
+	routingRecorder := newRoutingAttemptRecorder(h.routingAttemptEmitter, groupID, reqModel)
+	defer routingRecorder.finish()
 
 	// 生图意图的 /v1/responses 请求必须调度到确实支持 Responses API 的账号，否则
 	// 会在 forward 阶段被静默降级为无法生图的 Chat Completions 直转（#4417）。
@@ -555,6 +576,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			}()
 			return h.gatewayService.Forward(c.Request.Context(), c, account, attemptBody)
 		}()
+		recordRoutingAttemptIfClientPresent(c, routingRecorder, account.ID, result, err, time.Now())
 		cyberBlockKeyHTTP := ""
 		if service.GetOpsCyberPolicy(c) != nil {
 			cyberBlockKeyHTTP = service.CyberSessionBlockKey(apiKey.ID, c, sessionHashBody)
@@ -1698,6 +1720,12 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "model is required in first response.create payload")
 		return
 	}
+	groupID := int64(0)
+	if apiKey.GroupID != nil {
+		groupID = *apiKey.GroupID
+	}
+	wsRoutingRecorder := newRoutingAttemptWebSocketRecorder(h.routingAttemptEmitter, groupID, reqModel)
+	defer wsRoutingRecorder.finish()
 	ensureCompositeTargetPlatform(c, apiKey, reqModel)
 	ctx = c.Request.Context()
 	if apiKey.Group != nil && apiKey.Group.Platform == service.PlatformComposite {
@@ -2111,6 +2139,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				return nil
 			},
 			AfterTurn: func(turn int, result *service.OpenAIForwardResult, turnErr error) {
+				recordRoutingWebSocketAttemptIfClientPresent(c, wsRoutingRecorder, turn, account.ID, result, turnErr, time.Now())
 				// F1: cyber 标记按 turn 生命周期清理——defer 保证任意早返回路径都执行；
 				// CyberBlocked 必须在 submit 前同步预捕获（task 闭包由 worker 池异步执行，
 				// 届时 defer 已清除标记）。

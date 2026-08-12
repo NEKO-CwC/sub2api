@@ -18,6 +18,21 @@ import (
 
 var ErrOpsDisabled = infraerrors.NotFound("OPS_DISABLED", "Ops monitoring is disabled")
 
+const AccountConcurrencyConfirmationContractVersion = "account-concurrency-confirmation.v1"
+
+type AccountConcurrencyConfirmationItem struct {
+	AccountID          int64 `json:"account_id"`
+	CurrentConcurrency int   `json:"current_concurrency"`
+}
+
+type AccountConcurrencyConfirmation struct {
+	ContractVersion string                               `json:"contract_version"`
+	Source          string                               `json:"source"`
+	Confirmed       bool                                 `json:"confirmed"`
+	ObservedAt      time.Time                            `json:"observed_at"`
+	Accounts        []AccountConcurrencyConfirmationItem `json:"accounts"`
+}
+
 const (
 	opsMaxStoredErrorBodyBytes = 20 * 1024
 	// OpsErrorLogQueueBodyMaxBytes bounds attacker-controlled response data while
@@ -141,6 +156,34 @@ func NewOpsService(
 	svc.initRuntimeSettings(context.Background())
 	svc.applyRuntimeLogConfigOnStartup(context.Background())
 	return svc
+}
+
+// ConfirmAccountConcurrency returns a versioned, fail-closed Redis readback.
+func (s *OpsService) ConfirmAccountConcurrency(ctx context.Context, accountIDs []int64) (AccountConcurrencyConfirmation, error) {
+	if s == nil || s.concurrencyService == nil {
+		return AccountConcurrencyConfirmation{}, infraerrors.ServiceUnavailable(
+			"ACCOUNT_CONCURRENCY_CONFIRMATION_UNAVAILABLE",
+			"Account concurrency confirmation is unavailable",
+		)
+	}
+	counts, err := s.concurrencyService.ConfirmAccountConcurrencyBatch(ctx, accountIDs)
+	if err != nil {
+		return AccountConcurrencyConfirmation{}, infraerrors.ServiceUnavailable(
+			"ACCOUNT_CONCURRENCY_CONFIRMATION_UNAVAILABLE",
+			"Account concurrency confirmation is unavailable",
+		).WithCause(err)
+	}
+	items := make([]AccountConcurrencyConfirmationItem, 0, len(accountIDs))
+	for _, accountID := range accountIDs {
+		items = append(items, AccountConcurrencyConfirmationItem{
+			AccountID: accountID, CurrentConcurrency: counts[accountID],
+		})
+	}
+	return AccountConcurrencyConfirmation{
+		ContractVersion: AccountConcurrencyConfirmationContractVersion,
+		Source:          "redis_concurrency", Confirmed: true, ObservedAt: time.Now().UTC(),
+		Accounts: items,
+	}, nil
 }
 
 func (s *OpsService) RequireMonitoringEnabled(ctx context.Context) error {

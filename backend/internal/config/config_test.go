@@ -64,6 +64,60 @@ func TestLoadHTTPIngressSafetyDefaults(t *testing.T) {
 	require.Equal(t, 16384, cfg.APIKeyAuth.InvalidAbuse.Capacity)
 }
 
+func TestLoadRoutingAttemptEmitterEnvironmentAndDefaults(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_ENABLED", "true")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_PANEL_URL", "https://panel.example.test")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_SECRET", "test-secret")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_SUB2API_INSTANCE_ID", "7")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_QUEUE_SIZE", "512")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_BATCH_SIZE", "64")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_FLUSH_INTERVAL_MS", "500")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_REQUEST_TIMEOUT_MS", "1500")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_SHUTDOWN_TIMEOUT_MS", "6000")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.Equal(t, GatewayRoutingAttemptEmitterConfig{
+		Enabled: true, PanelURL: "https://panel.example.test", Secret: "test-secret",
+		Sub2APIInstanceID: 7, QueueSize: 512, BatchSize: 64, FlushIntervalMS: 500,
+		RequestTimeoutMS: 1500, ShutdownTimeoutMS: 6000,
+	}, cfg.Gateway.RoutingAttemptEmitter)
+}
+
+func TestValidateRoutingAttemptEmitterBounds(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*GatewayRoutingAttemptEmitterConfig)
+		want      string
+	}{
+		{"queue", func(c *GatewayRoutingAttemptEmitterConfig) {
+			c.QueueSize = GatewayRoutingAttemptEmitterMaxQueueSize + 1
+		}, "queue_size"},
+		{"batch", func(c *GatewayRoutingAttemptEmitterConfig) {
+			c.BatchSize = GatewayRoutingAttemptEmitterMaxBatchSize + 1
+		}, "batch_size"},
+		{"flush", func(c *GatewayRoutingAttemptEmitterConfig) {
+			c.FlushIntervalMS = GatewayRoutingAttemptEmitterMaxFlushIntervalMS + 1
+		}, "flush_interval_ms"},
+		{"request timeout", func(c *GatewayRoutingAttemptEmitterConfig) {
+			c.RequestTimeoutMS = GatewayRoutingAttemptEmitterMaxRequestTimeoutMS + 1
+		}, "request_timeout_ms"},
+		{"shutdown timeout", func(c *GatewayRoutingAttemptEmitterConfig) {
+			c.ShutdownTimeoutMS = GatewayRoutingAttemptEmitterMaxShutdownTimeoutMS + 1
+		}, "shutdown_timeout_ms"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resetViperWithJWTSecret(t)
+			cfg, err := Load()
+			require.NoError(t, err)
+			test.configure(&cfg.Gateway.RoutingAttemptEmitter)
+			require.ErrorContains(t, cfg.Validate(), test.want)
+		})
+	}
+}
+
 func TestNormalizeForwardedClientIPHeaders(t *testing.T) {
 	headers, err := NormalizeForwardedClientIPHeaders([]string{
 		" x-cdn-client-ip ",
