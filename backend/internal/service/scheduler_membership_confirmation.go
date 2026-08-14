@@ -134,7 +134,11 @@ func (s *SchedulerSnapshotService) ConfirmSchedulerMembership(
 	for _, groupID := range expected {
 		expectedSet[groupID] = struct{}{}
 	}
-	inspector := s.cache.(SchedulerSnapshotInspector)
+	inspector, ok := s.cache.(SchedulerSnapshotInspector)
+	if !ok {
+		result.ReasonCode = "scheduler_snapshot_inspection_unsupported"
+		return s.withSchedulerMembershipWatermark(ctx, result)
+	}
 	confirmed := true
 	for _, groupID := range affected {
 		buckets := []SchedulerBucket{

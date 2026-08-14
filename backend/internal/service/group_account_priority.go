@@ -79,7 +79,11 @@ func (s *adminServiceImpl) GetGroupAccountPriorities(ctx context.Context, groupI
 	if err := s.validateGroupAccountPriorityCapability(ctx, groupID); err != nil {
 		return nil, err
 	}
-	return s.accountRepo.(groupAccountPriorityRepository).GetGroupAccountPriorities(ctx, groupID)
+	repo, ok := s.accountRepo.(groupAccountPriorityRepository)
+	if !ok {
+		return nil, ErrGroupAccountPriorityUnsupported
+	}
+	return repo.GetGroupAccountPriorities(ctx, groupID)
 }
 
 func (s *adminServiceImpl) SetGroupAccountPriorities(ctx context.Context, groupID int64, input GroupAccountPriorityUpdate) (*GroupAccountPrioritySnapshot, error) {
@@ -122,7 +126,11 @@ func (s *adminServiceImpl) SetGroupAccountPriorities(ctx context.Context, groupI
 	if err := s.validateGroupAccountPriorityCapability(ctx, groupID); err != nil {
 		return nil, err
 	}
-	return s.accountRepo.(groupAccountPriorityRepository).PutGroupAccountPriorities(ctx, input)
+	repo, ok := s.accountRepo.(groupAccountPriorityRepository)
+	if !ok {
+		return nil, ErrGroupAccountPriorityUnsupported
+	}
+	return repo.PutGroupAccountPriorities(ctx, input)
 }
 
 func (s *adminServiceImpl) validateGroupAccountPriorityCapability(ctx context.Context, groupID int64) error {

@@ -84,8 +84,8 @@ func TestRoutingAttemptEmitterSendsBoundedSignedV2BatchForUntaggedRequests(t *te
 		canonicalBytes = bytes.ReplaceAll(canonicalBytes, []byte(`\u2029`), []byte("\u2029"))
 		timestamp := request.header.Get("X-Dispatch-Timestamp")
 		mac := hmac.New(sha256.New, []byte("test-secret"))
-		mac.Write([]byte(timestamp + "."))
-		mac.Write(canonicalBytes)
+		_, _ = mac.Write([]byte(timestamp + "."))
+		_, _ = mac.Write(canonicalBytes)
 		require.Equal(t, "routing-dispatch-attempt-hook.v1", request.header.Get("X-Dispatch-Signature-Version"))
 		require.Equal(t, "sha256="+hex.EncodeToString(mac.Sum(nil)), request.header.Get("X-Dispatch-Signature"))
 		_, err := strconv.ParseInt(timestamp, 10, 64)
@@ -540,7 +540,7 @@ func TestRoutingAttemptEmitterSplitsBatchesAtPanelRowLimit(t *testing.T) {
 	var mu sync.Mutex
 	rowCounts := make([]int, 0, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
+		defer func() { _ = r.Body.Close() }()
 		var payload struct {
 			Observation struct {
 				Attempts []routingAttemptRow `json:"attempts"`
@@ -584,7 +584,7 @@ func TestRoutingAttemptEmitterSplitsBatchesAtPanelRowLimit(t *testing.T) {
 func TestRoutingAttemptEmitterBoundedSendSkipsInvalidChain(t *testing.T) {
 	var received atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
+		defer func() { _ = r.Body.Close() }()
 		var payload struct {
 			Observation struct {
 				Attempts []routingAttemptRow `json:"attempts"`
@@ -658,7 +658,7 @@ func TestRoutingAttemptEmitterRetriesTransientPanelBusyWithSameIdentity(t *testi
 	operationIDs := make([]string, 0, routingAttemptSendMaxAttempts)
 	idempotencyKeys := make([]string, 0, routingAttemptSendMaxAttempts)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
+		defer func() { _ = r.Body.Close() }()
 		var payload struct {
 			OperationID string `json:"operation_id"`
 			Observation struct {

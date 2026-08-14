@@ -781,8 +781,8 @@ func validRoutingCorrelationDigest(value string) bool {
 func (e *RoutingAttemptEmitter) sendPayload(payload []byte) (int, error) {
 	timestamp := time.Now().Unix()
 	mac := hmac.New(sha256.New, []byte(e.cfg.Secret))
-	mac.Write([]byte(strconv.FormatInt(timestamp, 10) + "."))
-	mac.Write(payload)
+	_, _ = mac.Write([]byte(strconv.FormatInt(timestamp, 10) + "."))
+	_, _ = mac.Write(payload)
 	req, err := http.NewRequestWithContext(e.ctx, http.MethodPost, strings.TrimRight(e.cfg.PanelURL, "/")+"/api/account-ops/routing/dispatch/attempt-hook", bytes.NewReader(payload))
 	if err != nil {
 		return 0, err
@@ -820,8 +820,8 @@ func flattenChains(chains []routingAttemptChain) []routingAttemptRow {
 func batchIdentity(chains []routingAttemptChain) string {
 	h := sha256.New()
 	for _, chain := range chains {
-		h.Write([]byte(chain.IdempotencyKey))
-		h.Write([]byte{'\n'})
+		_, _ = h.Write([]byte(chain.IdempotencyKey))
+		_, _ = h.Write([]byte{'\n'})
 	}
 	return "batch-" + hex.EncodeToString(h.Sum(nil))
 }

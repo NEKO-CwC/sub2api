@@ -2105,7 +2105,7 @@ func TestOpenAIResponses_APIKeyPassthroughPool5xxRetriesThenExhaustsMaxSwitches(
 	cfg.Gateway.MaxAccountSwitches = 1
 	var emitted map[string]any
 	panel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
+		defer func() { _ = r.Body.Close() }()
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&emitted))
 		w.WriteHeader(http.StatusAccepted)
 	}))
@@ -2183,16 +2183,19 @@ func TestOpenAIResponses_APIKeyPassthroughPool5xxRetriesThenExhaustsMaxSwitches(
 	attempts, ok := observation["attempts"].([]any)
 	require.True(t, ok)
 	require.Len(t, attempts, 3)
-	require.Equal(t, []float64{9910, 9910, 9911}, []float64{
-		attempts[0].(map[string]any)["account_id"].(float64),
-		attempts[1].(map[string]any)["account_id"].(float64),
-		attempts[2].(map[string]any)["account_id"].(float64),
-	})
-	require.False(t, attempts[0].(map[string]any)["is_final"].(bool))
-	require.False(t, attempts[1].(map[string]any)["is_final"].(bool))
-	require.True(t, attempts[2].(map[string]any)["is_final"].(bool))
-	for _, attemptValue := range attempts {
-		attempt := attemptValue.(map[string]any)
+	attemptRows := make([]map[string]any, len(attempts))
+	for index, attemptValue := range attempts {
+		attempt, attemptOK := attemptValue.(map[string]any)
+		require.True(t, attemptOK)
+		attemptRows[index] = attempt
+	}
+	require.Equal(t, float64(9910), attemptRows[0]["account_id"])
+	require.Equal(t, float64(9910), attemptRows[1]["account_id"])
+	require.Equal(t, float64(9911), attemptRows[2]["account_id"])
+	require.Equal(t, false, attemptRows[0]["is_final"])
+	require.Equal(t, false, attemptRows[1]["is_final"])
+	require.Equal(t, true, attemptRows[2]["is_final"])
+	for _, attempt := range attemptRows {
 		require.Equal(t, float64(routingCanaryAPIKeyID), attempt["api_key_id"])
 		require.Equal(t, "e1b1b2d579954c11301a081b74115b84635228d1323d392be4c49789dacb0a95", attempt["correlation_sha256"])
 	}
@@ -2700,7 +2703,7 @@ func TestOpenAIResponsesWebSocket_FirstOutputTimeoutWithoutDownstreamReusesClien
 	cfg.Gateway.MaxAccountSwitches = 3
 	routingObservationCh := make(chan map[string]any, 1)
 	routingPanel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
+		defer func() { _ = r.Body.Close() }()
 		var payload map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -2827,18 +2830,23 @@ func TestOpenAIResponsesWebSocket_FirstOutputTimeoutWithoutDownstreamReusesClien
 	attempts, ok := observation["attempts"].([]any)
 	require.True(t, ok)
 	require.Len(t, attempts, 2)
-	require.Equal(t, float64(9912), attempts[0].(map[string]any)["account_id"])
-	require.Equal(t, "failure", attempts[0].(map[string]any)["outcome"])
-	require.False(t, attempts[0].(map[string]any)["is_final"].(bool))
-	require.Equal(t, float64(9913), attempts[1].(map[string]any)["account_id"])
-	require.Equal(t, "success", attempts[1].(map[string]any)["outcome"])
-	require.True(t, attempts[1].(map[string]any)["is_final"].(bool))
+	attemptRows := make([]map[string]any, len(attempts))
+	for index, attemptValue := range attempts {
+		attempt, attemptOK := attemptValue.(map[string]any)
+		require.True(t, attemptOK)
+		attemptRows[index] = attempt
+	}
+	require.Equal(t, float64(9912), attemptRows[0]["account_id"])
+	require.Equal(t, "failure", attemptRows[0]["outcome"])
+	require.Equal(t, false, attemptRows[0]["is_final"])
+	require.Equal(t, float64(9913), attemptRows[1]["account_id"])
+	require.Equal(t, "success", attemptRows[1]["outcome"])
+	require.Equal(t, true, attemptRows[1]["is_final"])
 	require.Equal(t,
-		attempts[0].(map[string]any)["logical_request_id"],
-		attempts[1].(map[string]any)["logical_request_id"],
+		attemptRows[0]["logical_request_id"],
+		attemptRows[1]["logical_request_id"],
 	)
-	for _, attemptValue := range attempts {
-		attempt := attemptValue.(map[string]any)
+	for _, attempt := range attemptRows {
 		require.Equal(t, float64(routingCanaryAPIKeyID), attempt["api_key_id"])
 		require.Equal(t, "e1b1b2d579954c11301a081b74115b84635228d1323d392be4c49789dacb0a95", attempt["correlation_sha256"])
 	}

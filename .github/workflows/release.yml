@@ -107,7 +107,7 @@ jobs:
           cache-dependency-path: backend/go.sum
 
       - name: Verify Go version
-        run: go version | grep -q 'go1.26.5'
+        run: go version | grep -q 'go1.26.6'
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3

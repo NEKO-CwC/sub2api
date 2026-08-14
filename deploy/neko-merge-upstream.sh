@@ -20,7 +20,7 @@ run_go() {
   docker run --rm \
     --volume "$repo_root:/src" \
     --workdir /src/backend \
-    golang:1.26.5-alpine \
+    golang:1.26.6-alpine \
     sh -c "$command"
 }
 

@@ -189,7 +189,6 @@ func queryGroupAccountPriorities(ctx context.Context, queryer groupAccountPriori
 	return items, nil
 }
 
-
 func sameGroupAccountPriorityAccounts(current, requested []service.GroupAccountPriorityItem) bool {
 	if len(current) != len(requested) {
 		return false
