@@ -270,6 +270,11 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		h.errorResponse(c, http.StatusInternalServerError, "api_error", "User context not found")
 		return
 	}
+	routingCorrelation, correlationStatus, correlationErr := consumeRoutingAttemptCorrelation(c.Request, apiKey)
+	if correlationErr != nil {
+		h.errorResponse(c, correlationStatus, "invalid_request_error", correlationErr.Error())
+		return
+	}
 	reqLog := requestLogger(
 		c,
 		"handler.openai_gateway.responses",
@@ -450,7 +455,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	if apiKey.GroupID != nil {
 		groupID = *apiKey.GroupID
 	}
-	routingRecorder := newRoutingAttemptRecorder(h.routingAttemptEmitter, groupID, reqModel)
+	routingRecorder := newRoutingAttemptRecorder(h.routingAttemptEmitter, groupID, reqModel, routingCorrelation)
 	defer routingRecorder.finish()
 
 	// 生图意图的 /v1/responses 请求必须调度到确实支持 Responses API 的账号，否则
@@ -1623,6 +1628,11 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		h.errorResponse(c, http.StatusInternalServerError, "api_error", "User context not found")
 		return
 	}
+	routingCorrelation, correlationStatus, correlationErr := consumeRoutingAttemptCorrelation(c.Request, apiKey)
+	if correlationErr != nil {
+		h.errorResponse(c, correlationStatus, "invalid_request_error", correlationErr.Error())
+		return
+	}
 
 	reqLog := requestLogger(
 		c,
@@ -1724,7 +1734,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	if apiKey.GroupID != nil {
 		groupID = *apiKey.GroupID
 	}
-	wsRoutingRecorder := newRoutingAttemptWebSocketRecorder(h.routingAttemptEmitter, groupID, reqModel)
+	wsRoutingRecorder := newRoutingAttemptWebSocketRecorder(h.routingAttemptEmitter, groupID, reqModel, routingCorrelation)
 	defer wsRoutingRecorder.finish()
 	ensureCompositeTargetPlatform(c, apiKey, reqModel)
 	ctx = c.Request.Context()

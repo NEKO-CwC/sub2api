@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -34,14 +35,14 @@ func TestRoutingAttemptEmitterDisabledByDefault(t *testing.T) {
 func TestRoutingAttemptEmitterDisabledPathAllocatesNothing(t *testing.T) {
 	allocations := testing.AllocsPerRun(1000, func() {
 		e := NewRoutingAttemptEmitter(config.GatewayRoutingAttemptEmitterConfig{})
-		if e != nil || newRoutingAttemptRecorder(e, 5, "gpt-5") != nil || newRoutingAttemptWebSocketRecorder(e, 5, "gpt-5") != nil {
+		if e != nil || newRoutingAttemptRecorder(e, 5, "gpt-5", routingAttemptCorrelation{}) != nil || newRoutingAttemptWebSocketRecorder(e, 5, "gpt-5", routingAttemptCorrelation{}) != nil {
 			panic("disabled emitter created runtime state")
 		}
 	})
 	require.Zero(t, allocations)
 }
 
-func TestRoutingAttemptEmitterSendsBoundedSignedV2Batch(t *testing.T) {
+func TestRoutingAttemptEmitterSendsBoundedSignedV2BatchForUntaggedRequests(t *testing.T) {
 	type receivedRequest struct {
 		payload map[string]any
 		header  http.Header
@@ -64,10 +65,11 @@ func TestRoutingAttemptEmitterSendsBoundedSignedV2Batch(t *testing.T) {
 	defer server.Close()
 	e := NewRoutingAttemptEmitter(config.GatewayRoutingAttemptEmitterConfig{
 		Enabled: true, PanelURL: server.URL, Secret: "test-secret", Sub2APIInstanceID: 7,
-		QueueSize: 2, BatchSize: 1, FlushIntervalMS: 10, RequestTimeoutMS: 500,
+		AllowedGroupIDs: []int64{5},
+		QueueSize:       2, BatchSize: 1, FlushIntervalMS: 10, RequestTimeoutMS: 500,
 	})
 	defer e.Close()
-	recorder := newRoutingAttemptRecorder(e, 5, "gpt-\u2028-5")
+	recorder := newRoutingAttemptRecorder(e, 5, "gpt-\u2028-5", routingAttemptCorrelation{})
 	recorder.record(10, nil, nil, time.Now())
 	recorder.finish()
 	select {
@@ -91,14 +93,231 @@ func TestRoutingAttemptEmitterSendsBoundedSignedV2Batch(t *testing.T) {
 		observation, ok := payload["observation"].(map[string]any)
 		require.True(t, ok)
 		require.Equal(t, "routing-dispatch-attempt-observation.v2", observation["schema_version"])
+		attempts, ok := observation["attempts"].([]any)
+		require.True(t, ok)
+		require.Len(t, attempts, 1)
+		attempt, ok := attempts[0].(map[string]any)
+		require.True(t, ok)
+		require.NotContains(t, attempt, "api_key_id")
+		require.NotContains(t, attempt, "correlation_sha256")
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for emitter batch")
 	}
 }
 
+func TestRoutingAttemptEmitterSendsV3BatchForTaggedRequestWithoutRawNonce(t *testing.T) {
+	nonce := strings.Repeat("A", routingCanaryNonceEncodedLength)
+	received := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		received <- body
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	e := NewRoutingAttemptEmitter(config.GatewayRoutingAttemptEmitterConfig{
+		Enabled: true, PanelURL: server.URL, Secret: "test-secret", Sub2APIInstanceID: 7,
+		AllowedGroupIDs: []int64{routingCanaryGroupID},
+		QueueSize:       2, BatchSize: 1, FlushIntervalMS: 10, RequestTimeoutMS: 500,
+	})
+	defer e.Close()
+	recorder := newRoutingAttemptRecorder(e, routingCanaryGroupID, "gpt-5", routingAttemptCorrelation{
+		APIKeyID:          routingCanaryAPIKeyID,
+		CorrelationSHA256: "e1b1b2d579954c11301a081b74115b84635228d1323d392be4c49789dacb0a95",
+	})
+	recorder.record(10, nil, &service.UpstreamFailoverError{StatusCode: http.StatusBadGateway}, time.Unix(1, 0))
+	recorder.record(11, &service.OpenAIForwardResult{FirstTokenMs: intPtr(100)}, nil, time.Unix(2, 0))
+	recorder.finish()
+
+	select {
+	case body := <-received:
+		require.NotContains(t, string(body), nonce)
+		var payload struct {
+			Observation struct {
+				SchemaVersion string              `json:"schema_version"`
+				Attempts      []routingAttemptRow `json:"attempts"`
+			} `json:"observation"`
+		}
+		require.NoError(t, json.Unmarshal(body, &payload))
+		require.Equal(t, routingAttemptObservationSchemaV3, payload.Observation.SchemaVersion)
+		require.Len(t, payload.Observation.Attempts, 2)
+		for _, attempt := range payload.Observation.Attempts {
+			require.Equal(t, routingCanaryAPIKeyID, attempt.APIKeyID)
+			require.NotNil(t, attempt.CorrelationSHA256)
+			require.Equal(t, "e1b1b2d579954c11301a081b74115b84635228d1323d392be4c49789dacb0a95", *attempt.CorrelationSHA256)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for tagged emitter batch")
+	}
+}
+
+func TestRoutingAttemptEmitterSeparatesTaggedV3FromUntaggedV2Batches(t *testing.T) {
+	var mu sync.Mutex
+	schemas := make([]string, 0, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Observation struct {
+				SchemaVersion string `json:"schema_version"`
+			} `json:"observation"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+		mu.Lock()
+		schemas = append(schemas, payload.Observation.SchemaVersion)
+		mu.Unlock()
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	e := NewRoutingAttemptEmitter(config.GatewayRoutingAttemptEmitterConfig{
+		Enabled: true, PanelURL: server.URL, Secret: "test-secret", Sub2APIInstanceID: 7,
+		AllowedGroupIDs: []int64{routingCanaryGroupID},
+		QueueSize:       2, BatchSize: 2, FlushIntervalMS: 60_000, RequestTimeoutMS: 500,
+	})
+	defer e.Close()
+	digest := "e1b1b2d579954c11301a081b74115b84635228d1323d392be4c49789dacb0a95"
+	e.sendGrouped([]routingAttemptChain{
+		{
+			GroupID: routingCanaryGroupID, Model: "gpt-5", ObservedAt: time.Unix(1, 0), IdempotencyKey: "untagged",
+			Attempts: []routingAttemptRow{{LogicalRequestID: "untagged", Attempt: 1, AccountID: 10, Outcome: "success"}},
+		},
+		{
+			GroupID: routingCanaryGroupID, Model: "gpt-5", ObservedAt: time.Unix(2, 0), IdempotencyKey: "tagged",
+			Attempts: []routingAttemptRow{{APIKeyID: routingCanaryAPIKeyID, CorrelationSHA256: &digest, LogicalRequestID: "tagged", Attempt: 1, AccountID: 11, Outcome: "success"}},
+		},
+	})
+
+	mu.Lock()
+	require.ElementsMatch(t, []string{routingAttemptObservationSchemaV2, routingAttemptObservationSchemaV3}, schemas)
+	mu.Unlock()
+}
+
+func TestRoutingAttemptEmitterDropsPartiallyTaggedChainFailClosed(t *testing.T) {
+	e := newTestRoutingAttemptEmitterForGroup(routingCanaryGroupID)
+	digest := "e1b1b2d579954c11301a081b74115b84635228d1323d392be4c49789dacb0a95"
+	e.sendGrouped([]routingAttemptChain{{
+		GroupID: routingCanaryGroupID, Model: "gpt-5", ObservedAt: time.Unix(1, 0), IdempotencyKey: "mixed",
+		Attempts: []routingAttemptRow{
+			{LogicalRequestID: "mixed", Attempt: 1, AccountID: 10, Outcome: "failure"},
+			{APIKeyID: routingCanaryAPIKeyID, CorrelationSHA256: &digest, LogicalRequestID: "mixed", Attempt: 2, AccountID: 11, Outcome: "success"},
+		},
+	}})
+	require.Equal(t, uint64(1), e.Stats().Dropped)
+	require.Empty(t, e.queue)
+}
+
+func TestConsumeRoutingAttemptCorrelationValidatesScopeAndHashesNonce(t *testing.T) {
+	nonce := strings.Repeat("A", routingCanaryNonceEncodedLength)
+	groupID := routingCanaryGroupID
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+	request.Header.Set(routingCanaryCorrelationHeader, nonce)
+
+	correlation, status, err := consumeRoutingAttemptCorrelation(request, &service.APIKey{
+		ID:      routingCanaryAPIKeyID,
+		GroupID: &groupID,
+	})
+
+	require.NoError(t, err)
+	require.Zero(t, status)
+	require.Equal(t, routingCanaryAPIKeyID, correlation.APIKeyID)
+	require.Equal(t, "e1b1b2d579954c11301a081b74115b84635228d1323d392be4c49789dacb0a95", correlation.CorrelationSHA256)
+	require.Empty(t, request.Header.Values(routingCanaryCorrelationHeader))
+}
+
+func TestConsumeRoutingAttemptCorrelationRejectsMalformedOrUnauthorizedValues(t *testing.T) {
+	validNonce := strings.Repeat("A", routingCanaryNonceEncodedLength)
+	validGroupID := routingCanaryGroupID
+	wrongGroupID := int64(31)
+	tests := []struct {
+		name       string
+		values     []string
+		apiKey     *service.APIKey
+		wantStatus int
+	}{
+		{name: "duplicate", values: []string{validNonce, validNonce}, apiKey: &service.APIKey{ID: routingCanaryAPIKeyID, GroupID: &validGroupID}, wantStatus: http.StatusBadRequest},
+		{name: "comma combined", values: []string{validNonce + "," + validNonce}, apiKey: &service.APIKey{ID: routingCanaryAPIKeyID, GroupID: &validGroupID}, wantStatus: http.StatusBadRequest},
+		{name: "short", values: []string{validNonce[:len(validNonce)-1]}, apiKey: &service.APIKey{ID: routingCanaryAPIKeyID, GroupID: &validGroupID}, wantStatus: http.StatusBadRequest},
+		{name: "long", values: []string{validNonce + "A"}, apiKey: &service.APIKey{ID: routingCanaryAPIKeyID, GroupID: &validGroupID}, wantStatus: http.StatusBadRequest},
+		{name: "invalid alphabet", values: []string{strings.Repeat("A", routingCanaryNonceEncodedLength-1) + "+"}, apiKey: &service.APIKey{ID: routingCanaryAPIKeyID, GroupID: &validGroupID}, wantStatus: http.StatusBadRequest},
+		{name: "leading whitespace", values: []string{" " + validNonce[:len(validNonce)-1]}, apiKey: &service.APIKey{ID: routingCanaryAPIKeyID, GroupID: &validGroupID}, wantStatus: http.StatusBadRequest},
+		{name: "control character", values: []string{validNonce[:len(validNonce)-1] + "\n"}, apiKey: &service.APIKey{ID: routingCanaryAPIKeyID, GroupID: &validGroupID}, wantStatus: http.StatusBadRequest},
+		{name: "non canonical trailing bits", values: []string{strings.Repeat("A", routingCanaryNonceEncodedLength-1) + "B"}, apiKey: &service.APIKey{ID: routingCanaryAPIKeyID, GroupID: &validGroupID}, wantStatus: http.StatusBadRequest},
+		{name: "wrong key", values: []string{validNonce}, apiKey: &service.APIKey{ID: 104, GroupID: &validGroupID}, wantStatus: http.StatusForbidden},
+		{name: "wrong group", values: []string{validNonce}, apiKey: &service.APIKey{ID: routingCanaryAPIKeyID, GroupID: &wrongGroupID}, wantStatus: http.StatusForbidden},
+		{name: "nil group", values: []string{validNonce}, apiKey: &service.APIKey{ID: routingCanaryAPIKeyID}, wantStatus: http.StatusForbidden},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+			request.Header[routingCanaryCorrelationHeader] = append([]string(nil), test.values...)
+
+			correlation, status, err := consumeRoutingAttemptCorrelation(request, test.apiKey)
+
+			require.Error(t, err)
+			require.Equal(t, test.wantStatus, status)
+			require.Equal(t, routingAttemptCorrelation{}, correlation)
+			require.Empty(t, request.Header.Values(routingCanaryCorrelationHeader))
+			for _, value := range test.values {
+				require.NotContains(t, err.Error(), value)
+			}
+		})
+	}
+}
+
+func TestConsumeRoutingAttemptCorrelationLeavesUntaggedRequestCompatible(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+	correlation, status, err := consumeRoutingAttemptCorrelation(request, nil)
+	require.NoError(t, err)
+	require.Zero(t, status)
+	require.Equal(t, routingAttemptCorrelation{}, correlation)
+}
+
+func TestRoutingAttemptRecorderPropagatesCorrelationToEveryRetryWithoutRawNonce(t *testing.T) {
+	nonce := strings.Repeat("A", routingCanaryNonceEncodedLength)
+	correlation := routingAttemptCorrelation{
+		APIKeyID:          routingCanaryAPIKeyID,
+		CorrelationSHA256: "e1b1b2d579954c11301a081b74115b84635228d1323d392be4c49789dacb0a95",
+	}
+	recorder := newRoutingAttemptRecorder(newTestRoutingAttemptEmitterForGroup(routingCanaryGroupID), routingCanaryGroupID, "gpt-5", correlation)
+	recorder.record(10, nil, &service.UpstreamFailoverError{StatusCode: http.StatusBadGateway}, time.Unix(1, 0))
+	recorder.record(11, &service.OpenAIForwardResult{FirstTokenMs: intPtr(200)}, nil, time.Unix(2, 0))
+
+	require.Len(t, recorder.attempts, 2)
+	for _, attempt := range recorder.attempts {
+		require.Equal(t, routingCanaryAPIKeyID, attempt.APIKeyID)
+		require.NotNil(t, attempt.CorrelationSHA256)
+		require.Equal(t, correlation.CorrelationSHA256, *attempt.CorrelationSHA256)
+	}
+	serialized, err := json.Marshal(recorder.attempts)
+	require.NoError(t, err)
+	require.NotContains(t, string(serialized), nonce)
+}
+
+func TestRoutingAttemptWebSocketRecorderPropagatesCorrelationAcrossTurns(t *testing.T) {
+	emitter := newTestRoutingAttemptEmitterForGroup(routingCanaryGroupID)
+	correlation := routingAttemptCorrelation{
+		APIKeyID:          routingCanaryAPIKeyID,
+		CorrelationSHA256: "e1b1b2d579954c11301a081b74115b84635228d1323d392be4c49789dacb0a95",
+	}
+	recorder := newRoutingAttemptWebSocketRecorder(emitter, routingCanaryGroupID, "gpt-5", correlation)
+	recorder.record(1, 10, nil, &service.UpstreamFailoverError{StatusCode: http.StatusBadGateway}, time.Unix(1, 0))
+	recorder.record(1, 11, &service.OpenAIForwardResult{OpenAIWSMode: true, UpstreamTerminalEvent: "response.completed"}, nil, time.Unix(2, 0))
+	recorder.record(2, 12, &service.OpenAIForwardResult{OpenAIWSMode: true, UpstreamTerminalEvent: "response.completed"}, nil, time.Unix(3, 0))
+
+	require.Len(t, emitter.queue, 2)
+	for range 2 {
+		chain := <-emitter.queue
+		require.NotEmpty(t, chain.Attempts)
+		for _, attempt := range chain.Attempts {
+			require.Equal(t, routingCanaryAPIKeyID, attempt.APIKeyID)
+			require.NotNil(t, attempt.CorrelationSHA256)
+			require.Equal(t, correlation.CorrelationSHA256, *attempt.CorrelationSHA256)
+		}
+	}
+}
+
 func TestRoutingAttemptRecorderCapturesGatewayFactsAndFinalMarker(t *testing.T) {
 	emitter := newTestRoutingAttemptEmitter()
-	recorder := newRoutingAttemptRecorder(emitter, 5, "gpt-5")
+	recorder := newRoutingAttemptRecorder(emitter, 5, "gpt-5", routingAttemptCorrelation{})
 	status := http.StatusBadGateway
 	recorder.record(10, nil, &service.UpstreamFailoverError{StatusCode: status, Reason: service.GatewayFailureReason("provider_unavailable")}, time.Unix(1, 0))
 	recorder.record(11, &service.OpenAIForwardResult{FirstTokenMs: intPtr(1200)}, nil, time.Unix(2, 0))
@@ -113,7 +332,7 @@ func TestRoutingAttemptRecorderCapturesGatewayFactsAndFinalMarker(t *testing.T) 
 }
 
 func TestRoutingAttemptRecorderUsesWebSocketTerminalOutcome(t *testing.T) {
-	recorder := newRoutingAttemptRecorder(newTestRoutingAttemptEmitter(), 5, "gpt-5")
+	recorder := newRoutingAttemptRecorder(newTestRoutingAttemptEmitter(), 5, "gpt-5", routingAttemptCorrelation{})
 	recorder.record(10, &service.OpenAIForwardResult{
 		OpenAIWSMode:          true,
 		UpstreamTerminalEvent: "response.failed",
@@ -134,8 +353,8 @@ func TestRoutingAttemptRecorderUsesWebSocketTerminalOutcome(t *testing.T) {
 
 func TestRoutingAttemptRecorderDoesNotCollapseReusedClientRequestID(t *testing.T) {
 	emitter := newTestRoutingAttemptEmitter()
-	first := newRoutingAttemptRecorder(emitter, 5, "gpt-5")
-	second := newRoutingAttemptRecorder(emitter, 5, "gpt-5")
+	first := newRoutingAttemptRecorder(emitter, 5, "gpt-5", routingAttemptCorrelation{})
+	second := newRoutingAttemptRecorder(emitter, 5, "gpt-5", routingAttemptCorrelation{})
 	require.NotEqual(t, first.logicalRequestID, second.logicalRequestID)
 	require.LessOrEqual(t, len(first.logicalRequestID), 128)
 	require.LessOrEqual(t, len(second.logicalRequestID), 128)
@@ -147,7 +366,7 @@ func TestRecordRoutingAttemptDiscardsCanceledInboundChain(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	requestContext, cancel := context.WithCancel(context.Background())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(requestContext)
-	recorder := newRoutingAttemptRecorder(newTestRoutingAttemptEmitter(), 5, "gpt-5")
+	recorder := newRoutingAttemptRecorder(newTestRoutingAttemptEmitter(), 5, "gpt-5", routingAttemptCorrelation{})
 	recorder.record(10, nil, &service.UpstreamFailoverError{StatusCode: http.StatusBadGateway}, time.Now())
 	cancel()
 
@@ -170,7 +389,7 @@ func TestRecordRoutingWebSocketAttemptDiscardsCanceledInboundTurn(t *testing.T) 
 	requestContext, cancel := context.WithCancel(context.Background())
 	c.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil).WithContext(requestContext)
 	emitter := newTestRoutingAttemptEmitter()
-	recorder := newRoutingAttemptWebSocketRecorder(emitter, 5, "gpt-5")
+	recorder := newRoutingAttemptWebSocketRecorder(emitter, 5, "gpt-5", routingAttemptCorrelation{})
 	recorder.record(1, 10, nil, &service.UpstreamFailoverError{StatusCode: http.StatusBadGateway}, time.Now())
 	cancel()
 
@@ -183,10 +402,47 @@ func TestRecordRoutingWebSocketAttemptDiscardsCanceledInboundTurn(t *testing.T) 
 
 func TestRoutingAttemptRecorderDoesNotSubmitUngroupedRequest(t *testing.T) {
 	e := newTestRoutingAttemptEmitter()
-	recorder := newRoutingAttemptRecorder(e, 0, "gpt-5")
-	recorder.record(10, nil, nil, time.Now())
-	recorder.finish()
+	recorder := newRoutingAttemptRecorder(e, 0, "gpt-5", routingAttemptCorrelation{})
+	require.Nil(t, recorder)
 	require.Empty(t, e.queue)
+}
+
+func TestRoutingAttemptRecorderRejectsGroupsOutsideAllowlistBeforeAllocation(t *testing.T) {
+	e := newTestRoutingAttemptEmitter()
+
+	require.Nil(t, newRoutingAttemptRecorder(e, 4, "gpt-5", routingAttemptCorrelation{}))
+	require.Nil(t, newRoutingAttemptWebSocketRecorder(e, 4, "gpt-5", routingAttemptCorrelation{}))
+	require.NotNil(t, newRoutingAttemptRecorder(e, 5, "gpt-5", routingAttemptCorrelation{}))
+	require.NotNil(t, newRoutingAttemptWebSocketRecorder(e, 5, "gpt-5", routingAttemptCorrelation{}))
+	require.Empty(t, e.queue)
+}
+
+func TestRoutingAttemptRecordersRejectTaggedCorrelationOutsideExactCanaryScope(t *testing.T) {
+	digest := "e1b1b2d579954c11301a081b74115b84635228d1323d392be4c49789dacb0a95"
+	tagged := routingAttemptCorrelation{APIKeyID: routingCanaryAPIKeyID, CorrelationSHA256: digest}
+	wrongGroupEmitter := newTestRoutingAttemptEmitterForGroup(5)
+	require.Nil(t, newRoutingAttemptRecorder(wrongGroupEmitter, 5, "gpt-5", tagged))
+	require.Nil(t, newRoutingAttemptWebSocketRecorder(wrongGroupEmitter, 5, "gpt-5", tagged))
+
+	canaryEmitter := newTestRoutingAttemptEmitterForGroup(routingCanaryGroupID)
+	partial := routingAttemptCorrelation{APIKeyID: routingCanaryAPIKeyID}
+	require.Nil(t, newRoutingAttemptRecorder(canaryEmitter, routingCanaryGroupID, "gpt-5", partial))
+	require.Nil(t, newRoutingAttemptWebSocketRecorder(canaryEmitter, routingCanaryGroupID, "gpt-5", partial))
+}
+
+func TestRoutingAttemptEmitterRejectsMissingOrInvalidAllowlist(t *testing.T) {
+	base := config.GatewayRoutingAttemptEmitterConfig{
+		Enabled: true, PanelURL: "https://panel.example.test", Secret: "test-secret",
+		Sub2APIInstanceID: 7, QueueSize: 2, BatchSize: 1,
+	}
+
+	require.Nil(t, NewRoutingAttemptEmitter(base))
+	base.AllowedGroupIDs = []int64{0}
+	require.Nil(t, NewRoutingAttemptEmitter(base))
+	base.AllowedGroupIDs = []int64{5, 5}
+	require.Nil(t, NewRoutingAttemptEmitter(base))
+	base.AllowedGroupIDs = []int64{5}
+	require.NotNil(t, NewRoutingAttemptEmitter(base))
 }
 
 func TestRoutingAttemptEmitterCloseIsBoundedByShutdownTimeout(t *testing.T) {
@@ -205,7 +461,8 @@ func TestRoutingAttemptEmitterCloseIsBoundedByShutdownTimeout(t *testing.T) {
 	}()
 	e := NewRoutingAttemptEmitter(config.GatewayRoutingAttemptEmitterConfig{
 		Enabled: true, PanelURL: server.URL, Secret: "test-secret", Sub2APIInstanceID: 7,
-		QueueSize: 1, BatchSize: 1, FlushIntervalMS: 60_000, RequestTimeoutMS: 5_000,
+		AllowedGroupIDs: []int64{5},
+		QueueSize:       1, BatchSize: 1, FlushIntervalMS: 60_000, RequestTimeoutMS: 5_000,
 		ShutdownTimeoutMS: 25,
 	})
 	require.True(t, e.Submit(routingAttemptChain{
@@ -237,7 +494,8 @@ func TestRoutingAttemptEmitterCloseDrainsEveryAcceptedChain(t *testing.T) {
 	defer server.Close()
 	e := NewRoutingAttemptEmitter(config.GatewayRoutingAttemptEmitterConfig{
 		Enabled: true, PanelURL: server.URL, Secret: "test-secret", Sub2APIInstanceID: 7,
-		QueueSize: 3, BatchSize: 1, FlushIntervalMS: 60_000, RequestTimeoutMS: 2_000,
+		AllowedGroupIDs: []int64{5},
+		QueueSize:       3, BatchSize: 1, FlushIntervalMS: 60_000, RequestTimeoutMS: 2_000,
 	})
 	chain := func(id string) routingAttemptChain {
 		return routingAttemptChain{
@@ -297,7 +555,8 @@ func TestRoutingAttemptEmitterSplitsBatchesAtPanelRowLimit(t *testing.T) {
 	defer server.Close()
 	e := NewRoutingAttemptEmitter(config.GatewayRoutingAttemptEmitterConfig{
 		Enabled: true, PanelURL: server.URL, Secret: "test-secret", Sub2APIInstanceID: 7,
-		QueueSize: 2, BatchSize: 2, FlushIntervalMS: 60_000, RequestTimeoutMS: 2_000,
+		AllowedGroupIDs: []int64{5},
+		QueueSize:       2, BatchSize: 2, FlushIntervalMS: 60_000, RequestTimeoutMS: 2_000,
 	})
 	defer e.Close()
 	chain := func(id string, rows int) routingAttemptChain {
@@ -339,7 +598,8 @@ func TestRoutingAttemptEmitterBoundedSendSkipsInvalidChain(t *testing.T) {
 	defer server.Close()
 	e := NewRoutingAttemptEmitter(config.GatewayRoutingAttemptEmitterConfig{
 		Enabled: true, PanelURL: server.URL, Secret: "test-secret", Sub2APIInstanceID: 7,
-		QueueSize: 2, BatchSize: 2, FlushIntervalMS: 60_000, RequestTimeoutMS: 2_000,
+		AllowedGroupIDs: []int64{5},
+		QueueSize:       2, BatchSize: 2, FlushIntervalMS: 60_000, RequestTimeoutMS: 2_000,
 	})
 	defer e.Close()
 	valid := routingAttemptChain{
@@ -372,7 +632,8 @@ func TestRoutingAttemptEmitterDrainsSmallResponseForConnectionReuse(t *testing.T
 	defer server.Close()
 	e := NewRoutingAttemptEmitter(config.GatewayRoutingAttemptEmitterConfig{
 		Enabled: true, PanelURL: server.URL, Secret: "test-secret", Sub2APIInstanceID: 7,
-		QueueSize: 2, BatchSize: 1, FlushIntervalMS: 60_000, RequestTimeoutMS: 2_000,
+		AllowedGroupIDs: []int64{5},
+		QueueSize:       2, BatchSize: 1, FlushIntervalMS: 60_000, RequestTimeoutMS: 2_000,
 	})
 	defer e.Close()
 	chain := func(id string) routingAttemptChain {
@@ -390,11 +651,157 @@ func TestRoutingAttemptEmitterDrainsSmallResponseForConnectionReuse(t *testing.T
 	mu.Unlock()
 }
 
+func TestRoutingAttemptEmitterRetriesTransientPanelBusyWithSameIdentity(t *testing.T) {
+	useFastRoutingAttemptRetries(t)
+	var requests atomic.Int64
+	var mu sync.Mutex
+	operationIDs := make([]string, 0, routingAttemptSendMaxAttempts)
+	idempotencyKeys := make([]string, 0, routingAttemptSendMaxAttempts)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var payload struct {
+			OperationID string `json:"operation_id"`
+			Observation struct {
+				IdempotencyKey string `json:"idempotency_key"`
+			} `json:"observation"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+		mu.Lock()
+		operationIDs = append(operationIDs, payload.OperationID)
+		idempotencyKeys = append(idempotencyKeys, payload.Observation.IdempotencyKey)
+		mu.Unlock()
+		if requests.Add(1) < routingAttemptSendMaxAttempts {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	e := NewRoutingAttemptEmitter(config.GatewayRoutingAttemptEmitterConfig{
+		Enabled: true, PanelURL: server.URL, Secret: "test-secret", Sub2APIInstanceID: 7,
+		AllowedGroupIDs: []int64{5},
+		QueueSize:       1, BatchSize: 1, FlushIntervalMS: 60_000, RequestTimeoutMS: 2_000,
+	})
+	defer e.Close()
+	chain := routingAttemptChain{
+		GroupID: 5, Model: "gpt-5", ObservedAt: time.Now(), IdempotencyKey: "panel-busy",
+		Attempts: []routingAttemptRow{{LogicalRequestID: "panel-busy", Attempt: 1, AccountID: 10, Outcome: "success"}},
+	}
+
+	e.send([]routingAttemptChain{chain})
+
+	require.Equal(t, int64(routingAttemptSendMaxAttempts), requests.Load())
+	require.Equal(t, uint64(1), e.Stats().Sent)
+	require.Zero(t, e.Stats().Failures)
+	mu.Lock()
+	require.Len(t, operationIDs, routingAttemptSendMaxAttempts)
+	require.Len(t, idempotencyKeys, routingAttemptSendMaxAttempts)
+	for index := 1; index < routingAttemptSendMaxAttempts; index++ {
+		require.Equal(t, operationIDs[0], operationIDs[index])
+		require.Equal(t, idempotencyKeys[0], idempotencyKeys[index])
+	}
+	mu.Unlock()
+}
+
+func TestRoutingAttemptEmitterDoesNotRetryPermanentPanelRejection(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	e := NewRoutingAttemptEmitter(config.GatewayRoutingAttemptEmitterConfig{
+		Enabled: true, PanelURL: server.URL, Secret: "test-secret", Sub2APIInstanceID: 7,
+		AllowedGroupIDs: []int64{5},
+		QueueSize:       1, BatchSize: 1, FlushIntervalMS: 60_000, RequestTimeoutMS: 2_000,
+	})
+	defer e.Close()
+
+	e.send([]routingAttemptChain{{
+		GroupID: 5, Model: "gpt-5", ObservedAt: time.Now(), IdempotencyKey: "permanent-reject",
+		Attempts: []routingAttemptRow{{LogicalRequestID: "permanent-reject", Attempt: 1, AccountID: 10, Outcome: "success"}},
+	}})
+
+	require.Equal(t, int64(1), requests.Load())
+	require.Zero(t, e.Stats().Sent)
+	require.Equal(t, uint64(1), e.Stats().Failures)
+}
+
+func TestRoutingAttemptEmitterRetriesTransientTransportFailure(t *testing.T) {
+	useFastRoutingAttemptRetries(t)
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) < routingAttemptSendMaxAttempts {
+			time.Sleep(10 * time.Millisecond)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	e := NewRoutingAttemptEmitter(config.GatewayRoutingAttemptEmitterConfig{
+		Enabled: true, PanelURL: server.URL, Secret: "test-secret", Sub2APIInstanceID: 7,
+		AllowedGroupIDs: []int64{5},
+		QueueSize:       1, BatchSize: 1, FlushIntervalMS: 60_000, RequestTimeoutMS: 5,
+	})
+	defer e.Close()
+
+	e.send([]routingAttemptChain{{
+		GroupID: 5, Model: "gpt-5", ObservedAt: time.Now(), IdempotencyKey: "transport-retry",
+		Attempts: []routingAttemptRow{{LogicalRequestID: "transport-retry", Attempt: 1, AccountID: 10, Outcome: "success"}},
+	}})
+
+	require.Equal(t, int64(routingAttemptSendMaxAttempts), requests.Load())
+	require.Equal(t, uint64(1), e.Stats().Sent)
+	require.Zero(t, e.Stats().Failures)
+}
+
+func TestRoutingAttemptEmitterExhaustsTransientPanelRetriesAsOneFailure(t *testing.T) {
+	useFastRoutingAttemptRetries(t)
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	e := NewRoutingAttemptEmitter(config.GatewayRoutingAttemptEmitterConfig{
+		Enabled: true, PanelURL: server.URL, Secret: "test-secret", Sub2APIInstanceID: 7,
+		AllowedGroupIDs: []int64{5},
+		QueueSize:       1, BatchSize: 1, FlushIntervalMS: 60_000, RequestTimeoutMS: 2_000,
+	})
+	defer e.Close()
+
+	e.send([]routingAttemptChain{{
+		GroupID: 5, Model: "gpt-5", ObservedAt: time.Now(), IdempotencyKey: "transient-exhausted",
+		Attempts: []routingAttemptRow{{LogicalRequestID: "transient-exhausted", Attempt: 1, AccountID: 10, Outcome: "success"}},
+	}})
+
+	require.Equal(t, int64(routingAttemptSendMaxAttempts), requests.Load())
+	require.Zero(t, e.Stats().Sent)
+	require.Equal(t, uint64(1), e.Stats().Failures)
+	require.Equal(t, "http_status", e.Stats().LastFailureKind)
+	require.Equal(t, http.StatusServiceUnavailable, e.Stats().LastFailureStatusCode)
+	require.NotEmpty(t, e.Stats().LastFailureAt)
+}
+
+func useFastRoutingAttemptRetries(t *testing.T) {
+	t.Helper()
+	original := routingAttemptRetryDelays
+	for index := range routingAttemptRetryDelays {
+		routingAttemptRetryDelays[index] = time.Millisecond
+	}
+	t.Cleanup(func() { routingAttemptRetryDelays = original })
+}
+
 func intPtr(value int) *int { return &value }
 
 func newTestRoutingAttemptEmitter() *RoutingAttemptEmitter {
+	return newTestRoutingAttemptEmitterForGroup(5)
+}
+
+func newTestRoutingAttemptEmitterForGroup(groupID int64) *RoutingAttemptEmitter {
 	return &RoutingAttemptEmitter{
-		cfg:   config.GatewayRoutingAttemptEmitterConfig{Enabled: true},
-		queue: make(chan routingAttemptChain, 8),
+		cfg:           config.GatewayRoutingAttemptEmitterConfig{Enabled: true, AllowedGroupIDs: []int64{groupID}},
+		allowedGroups: map[int64]struct{}{groupID: {}},
+		queue:         make(chan routingAttemptChain, 8),
 	}
 }

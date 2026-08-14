@@ -542,6 +542,9 @@ gateway:
   # Scheduling configuration
   # 调度配置
   scheduling:
+    # Use account_groups.priority for Group-scoped OpenAI scheduling. Default
+    # false preserves the historical global accounts.priority behavior.
+    group_scoped_priority_enabled: false
     # Sticky session max waiting queue size
     # 粘性会话最大排队长度
     sticky_session_max_waiting: 3

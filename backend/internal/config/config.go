@@ -10,6 +10,8 @@ import (
 	"net/textproto"
 	"net/url"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -1033,15 +1035,16 @@ type GatewayConfig struct {
 // GatewayRoutingAttemptEmitterConfig reports gateway facts while routing
 // policy remains owned by the Panel.
 type GatewayRoutingAttemptEmitterConfig struct {
-	Enabled           bool   `mapstructure:"enabled"`
-	PanelURL          string `mapstructure:"panel_url"`
-	Secret            string `mapstructure:"secret"`
-	Sub2APIInstanceID int64  `mapstructure:"sub2api_instance_id"`
-	QueueSize         int    `mapstructure:"queue_size"`
-	BatchSize         int    `mapstructure:"batch_size"`
-	FlushIntervalMS   int    `mapstructure:"flush_interval_ms"`
-	RequestTimeoutMS  int    `mapstructure:"request_timeout_ms"`
-	ShutdownTimeoutMS int    `mapstructure:"shutdown_timeout_ms"`
+	Enabled           bool    `mapstructure:"enabled"`
+	PanelURL          string  `mapstructure:"panel_url"`
+	Secret            string  `mapstructure:"secret"`
+	Sub2APIInstanceID int64   `mapstructure:"sub2api_instance_id"`
+	AllowedGroupIDs   []int64 `mapstructure:"allowed_group_ids"`
+	QueueSize         int     `mapstructure:"queue_size"`
+	BatchSize         int     `mapstructure:"batch_size"`
+	FlushIntervalMS   int     `mapstructure:"flush_interval_ms"`
+	RequestTimeoutMS  int     `mapstructure:"request_timeout_ms"`
+	ShutdownTimeoutMS int     `mapstructure:"shutdown_timeout_ms"`
 }
 
 const (
@@ -1387,6 +1390,11 @@ type TLSProfileConfig struct {
 
 // GatewaySchedulingConfig accounts scheduling configuration.
 type GatewaySchedulingConfig struct {
+	// GroupScopedPriorityEnabled allows OpenAI requests scoped to one Group to
+	// rank accounts by account_groups.priority. It is disabled by default so
+	// existing deployments retain the global accounts.priority behavior.
+	GroupScopedPriorityEnabled bool `mapstructure:"group_scoped_priority_enabled"`
+
 	// 粘性会话排队配置
 	StickySessionMaxWaiting  int           `mapstructure:"sticky_session_max_waiting"`
 	StickySessionWaitTimeout time.Duration `mapstructure:"sticky_session_wait_timeout"`
@@ -1708,6 +1716,40 @@ func NormalizeRunMode(value string) string {
 	}
 }
 
+func parseRoutingAttemptAllowedGroupIDs(value string) ([]int64, error) {
+	parts := strings.Split(value, ",")
+	groupIDs := make([]int64, 0, len(parts))
+	for _, part := range parts {
+		normalized := strings.TrimSpace(part)
+		if normalized == "" {
+			return nil, fmt.Errorf("gateway.routing_attempt_emitter.allowed_group_ids must be a comma-separated list of positive integers")
+		}
+		groupID, err := strconv.ParseInt(normalized, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("gateway.routing_attempt_emitter.allowed_group_ids must be a comma-separated list of positive integers")
+		}
+		groupIDs = append(groupIDs, groupID)
+	}
+	return normalizeRoutingAttemptAllowedGroupIDs(groupIDs)
+}
+
+func normalizeRoutingAttemptAllowedGroupIDs(value []int64) ([]int64, error) {
+	if len(value) == 0 {
+		return nil, fmt.Errorf("gateway.routing_attempt_emitter.allowed_group_ids must contain at least one Group when enabled")
+	}
+	result := append([]int64(nil), value...)
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	for index, groupID := range result {
+		if groupID <= 0 {
+			return nil, fmt.Errorf("gateway.routing_attempt_emitter.allowed_group_ids must contain only positive Group IDs")
+		}
+		if index > 0 && result[index-1] == groupID {
+			return nil, fmt.Errorf("gateway.routing_attempt_emitter.allowed_group_ids must not contain duplicate Group IDs")
+		}
+	}
+	return result, nil
+}
+
 // Load 读取并校验完整配置（要求 jwt.secret 已显式提供）。
 func Load() (*Config, error) {
 	return load(false)
@@ -1743,6 +1785,18 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 	}
 	trustedProxiesEnv, trustedProxiesEnvConfigured := os.LookupEnv("SERVER_TRUSTED_PROXIES")
 	forwardedClientIPHeadersEnv, forwardedClientIPHeadersEnvConfigured := os.LookupEnv("SECURITY_FORWARDED_CLIENT_IP_HEADERS")
+	routingAttemptAllowedGroupsEnv, routingAttemptAllowedGroupsEnvConfigured := os.LookupEnv("GATEWAY_ROUTING_ATTEMPT_EMITTER_ALLOWED_GROUP_IDS")
+	if routingAttemptAllowedGroupsEnvConfigured {
+		allowedGroupIDs := []int64{}
+		if strings.TrimSpace(routingAttemptAllowedGroupsEnv) != "" {
+			var err error
+			allowedGroupIDs, err = parseRoutingAttemptAllowedGroupIDs(routingAttemptAllowedGroupsEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		viper.Set("gateway.routing_attempt_emitter.allowed_group_ids", allowedGroupIDs)
+	}
 	trustedProxiesConfigured := viper.InConfig("server.trusted_proxies") ||
 		viper.IsSet("server.trusted_proxies") || trustedProxiesEnvConfigured
 
@@ -2404,6 +2458,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.image_nonstream_keepalive_interval", 0)
 	viper.SetDefault("gateway.max_line_size", 500*1024*1024)
 	viper.SetDefault("gateway.scheduling.sticky_session_max_waiting", 3)
+	viper.SetDefault("gateway.scheduling.group_scoped_priority_enabled", false)
 	viper.SetDefault("gateway.scheduling.sticky_session_wait_timeout", 120*time.Second)
 	viper.SetDefault("gateway.scheduling.fallback_wait_timeout", 30*time.Second)
 	viper.SetDefault("gateway.scheduling.fallback_max_waiting", 100)
@@ -2444,6 +2499,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.routing_attempt_emitter.panel_url", "")
 	viper.SetDefault("gateway.routing_attempt_emitter.secret", "")
 	viper.SetDefault("gateway.routing_attempt_emitter.sub2api_instance_id", 0)
+	viper.SetDefault("gateway.routing_attempt_emitter.allowed_group_ids", []int64{})
 	viper.SetDefault("gateway.routing_attempt_emitter.queue_size", 256)
 	viper.SetDefault("gateway.routing_attempt_emitter.batch_size", 32)
 	viper.SetDefault("gateway.routing_attempt_emitter.flush_interval_ms", 250)
@@ -3480,6 +3536,9 @@ func (c *Config) Validate() error {
 	if c.Gateway.RoutingAttemptEmitter.Enabled {
 		if strings.TrimSpace(c.Gateway.RoutingAttemptEmitter.PanelURL) == "" || strings.TrimSpace(c.Gateway.RoutingAttemptEmitter.Secret) == "" || c.Gateway.RoutingAttemptEmitter.Sub2APIInstanceID <= 0 {
 			return fmt.Errorf("gateway.routing_attempt_emitter requires panel_url, secret, and positive sub2api_instance_id when enabled")
+		}
+		if _, err := normalizeRoutingAttemptAllowedGroupIDs(c.Gateway.RoutingAttemptEmitter.AllowedGroupIDs); err != nil {
+			return err
 		}
 	}
 	if c.Gateway.UsageRecord.QueueSize <= 0 {

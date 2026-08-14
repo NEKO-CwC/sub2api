@@ -21,7 +21,8 @@ func TestRoutingAttemptEmitterHealthOmitsSensitiveConfiguration(t *testing.T) {
 	}}
 	h.routingAttemptEmitter.stats.sent.Add(2)
 	h.routingAttemptEmitter.stats.dropped.Add(1)
-	h.routingAttemptEmitter.stats.failures.Add(4)
+	h.routingAttemptEmitter.stats.failures.Add(3)
+	h.routingAttemptEmitter.recordFailure(routingAttemptFailureHTTPStatus, http.StatusServiceUnavailable)
 
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
@@ -35,9 +36,14 @@ func TestRoutingAttemptEmitterHealthOmitsSensitiveConfiguration(t *testing.T) {
 		Data RoutingAttemptEmitterStats `json:"data"`
 	}
 	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body))
-	require.Equal(t, RoutingAttemptEmitterStats{
-		Enabled: true, Sent: 2, Dropped: 1, Failures: 4, QueueCapacity: 3,
-	}, body.Data)
+	require.True(t, body.Data.Enabled)
+	require.Equal(t, uint64(2), body.Data.Sent)
+	require.Equal(t, uint64(1), body.Data.Dropped)
+	require.Equal(t, uint64(4), body.Data.Failures)
+	require.Equal(t, 3, body.Data.QueueCapacity)
+	require.NotEmpty(t, body.Data.LastFailureAt)
+	require.Equal(t, "http_status", body.Data.LastFailureKind)
+	require.Equal(t, http.StatusServiceUnavailable, body.Data.LastFailureStatusCode)
 }
 
 func TestRoutingAttemptEmitterHealthReportsDisabledWithoutRuntimeAllocation(t *testing.T) {

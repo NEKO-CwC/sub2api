@@ -188,6 +188,8 @@ func registerOpsRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 		ops.GET("/account-availability", h.Admin.Ops.GetAccountAvailability)
 		ops.POST("/account-concurrency/confirm", h.Admin.Ops.ConfirmAccountConcurrency)
 		ops.GET("/realtime-traffic", h.Admin.Ops.GetRealtimeTrafficSummary)
+		ops.GET("/scheduler-membership/capability", h.Admin.Ops.GetSchedulerMembershipConfirmationCapability)
+		ops.POST("/scheduler-membership/confirm", h.Admin.Ops.ConfirmSchedulerMembership)
 		ops.GET("/routing-attempt-emitter/health", h.OpenAIGateway.GetRoutingAttemptEmitterHealth)
 
 		// Alerts (rules + events)
@@ -338,6 +340,8 @@ func registerGroupRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 		groups.PUT("/:id", h.Admin.Group.Update)
 		groups.DELETE("/:id", h.Admin.Group.Delete)
 		groups.GET("/:id/stats", h.Admin.Group.GetStats)
+		groups.GET("/:id/account-priorities", h.Admin.Group.GetGroupAccountPriorities)
+		groups.PUT("/:id/account-priorities", h.Admin.Group.SetGroupAccountPriorities)
 		groups.GET("/:id/rate-multipliers", h.Admin.Group.GetGroupRateMultipliers)
 		groups.PUT("/:id/rate-multipliers", h.Admin.Group.BatchSetGroupRateMultipliers)
 		groups.DELETE("/:id/rate-multipliers", h.Admin.Group.ClearGroupRateMultipliers)

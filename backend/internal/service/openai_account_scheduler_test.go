@@ -2608,7 +2608,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_SubscriptionPriorityDis
 	}
 }
 
-func TestOpenAIGatewayService_SelectAccountWithScheduler_UsesAccountPriorityWithinGroupPool(t *testing.T) {
+func TestOpenAIGatewayService_SelectAccountWithScheduler_UsesMatchingGroupPriority(t *testing.T) {
 	ctx := context.Background()
 	groupID := int64(10123)
 	accounts := []Account{
@@ -2640,6 +2640,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_UsesAccountPriorityWith
 		},
 	}
 	cfg := newSchedulerTestSubscriptionPriorityConfig()
+	cfg.Gateway.Scheduling.GroupScopedPriorityEnabled = true
 	cfg.Gateway.OpenAIWS.SchedulerScoreWeights.Load = 0
 	cfg.Gateway.OpenAIWS.SchedulerScoreWeights.Queue = 0
 	svc := &OpenAIGatewayService{
@@ -2654,8 +2655,63 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_UsesAccountPriorityWith
 	require.NoError(t, err)
 	require.NotNil(t, selection)
 	require.NotNil(t, selection.Account)
-	require.Equal(t, int64(21631), selection.Account.ID)
+	require.Equal(t, int64(21632), selection.Account.ID)
 	require.Equal(t, openAIAccountScheduleLayerLoadBalance, decision.Layer)
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+}
+
+func TestOpenAIAccountSchedulingPriorityRequiresExplicitGroupScopedFlag(t *testing.T) {
+	groupID := int64(10123)
+	account := &Account{
+		Priority: 7,
+		AccountGroups: []AccountGroup{
+			{GroupID: groupID, Priority: 3},
+		},
+	}
+
+	require.Equal(t, 7, openAIAccountSchedulingPriority(account, &groupID, false))
+	require.Equal(t, 3, openAIAccountSchedulingPriority(account, &groupID, true))
+	require.Equal(t, 7, openAIAccountSchedulingPriority(account, nil, true))
+
+	legacySnapshot := &Account{Priority: 5, GroupIDs: []int64{groupID}}
+	require.Equal(t, 5, openAIAccountSchedulingPriority(legacySnapshot, &groupID, true))
+}
+
+func TestOpenAIGatewayService_SelectAccountWithScheduler_DefaultsToGlobalPriority(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(10124)
+	accounts := []Account{
+		{
+			ID: 21641, Platform: PlatformOpenAI, Type: AccountTypeAPIKey,
+			Status: StatusActive, Schedulable: true, Concurrency: 1, Priority: 1,
+			AccountGroups: []AccountGroup{{AccountID: 21641, GroupID: groupID, Priority: 100}},
+			GroupIDs:      []int64{groupID},
+		},
+		{
+			ID: 21642, Platform: PlatformOpenAI, Type: AccountTypeAPIKey,
+			Status: StatusActive, Schedulable: true, Concurrency: 1, Priority: 100,
+			AccountGroups: []AccountGroup{{AccountID: 21642, GroupID: groupID, Priority: 1}},
+			GroupIDs:      []int64{groupID},
+		},
+	}
+	cfg := newSchedulerTestSubscriptionPriorityConfig()
+	cfg.Gateway.OpenAIWS.SchedulerScoreWeights.Load = 0
+	cfg.Gateway.OpenAIWS.SchedulerScoreWeights.Queue = 0
+	svc := &OpenAIGatewayService{
+		accountRepo:        schedulerGroupAwareOpenAIAccountRepo{schedulerTestOpenAIAccountRepo{accounts: accounts}},
+		cache:              &schedulerTestGatewayCache{},
+		cfg:                cfg,
+		rateLimitService:   newOpenAIAdvancedSchedulerRateLimitService("true"),
+		concurrencyService: NewConcurrencyService(schedulerTestConcurrencyCache{}),
+	}
+
+	selection, _, err := svc.SelectAccountWithScheduler(ctx, &groupID, "", "session_global_priority", "gpt-5.1", nil, OpenAIUpstreamTransportAny, false)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.NotNil(t, selection.Account)
+	require.Equal(t, int64(21641), selection.Account.ID)
 	if selection.ReleaseFunc != nil {
 		selection.ReleaseFunc()
 	}
@@ -3211,21 +3267,25 @@ func TestSelectTopKOpenAICandidates(t *testing.T) {
 			account:  &Account{ID: 11, Priority: 2},
 			loadInfo: &AccountLoadInfo{LoadRate: 10, WaitingCount: 1},
 			score:    10.0,
+			priority: 2,
 		},
 		{
 			account:  &Account{ID: 12, Priority: 1},
 			loadInfo: &AccountLoadInfo{LoadRate: 20, WaitingCount: 1},
 			score:    9.5,
+			priority: 1,
 		},
 		{
 			account:  &Account{ID: 13, Priority: 1},
 			loadInfo: &AccountLoadInfo{LoadRate: 30, WaitingCount: 0},
 			score:    10.0,
+			priority: 1,
 		},
 		{
 			account:  &Account{ID: 14, Priority: 0},
 			loadInfo: &AccountLoadInfo{LoadRate: 40, WaitingCount: 0},
 			score:    8.0,
+			priority: 0,
 		},
 	}
 

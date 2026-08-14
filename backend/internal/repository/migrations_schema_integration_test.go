@@ -176,6 +176,25 @@ WHERE ns.nspname = 'public'
 	// account_groups: created_at should be timestamptz
 	requireColumn(t, tx, "account_groups", "created_at", "timestamp with time zone", 0, false)
 
+	// group_account_priority_operations: durable idempotency and readback ledger.
+	var groupAccountPriorityOperationsRegclass sql.NullString
+	require.NoError(t, tx.QueryRowContext(context.Background(), "SELECT to_regclass('public.group_account_priority_operations')").Scan(&groupAccountPriorityOperationsRegclass))
+	require.True(t, groupAccountPriorityOperationsRegclass.Valid, "expected group_account_priority_operations table to exist")
+	requireColumn(t, tx, "group_account_priority_operations", "operation_id", "character varying", 128, false)
+	requireColumn(t, tx, "group_account_priority_operations", "request_hash", "character varying", 71, false)
+	requireColumn(t, tx, "group_account_priority_operations", "expected_readback_hash", "character varying", 71, false)
+	requireColumn(t, tx, "group_account_priority_operations", "readback_hash", "character varying", 71, false)
+	requireColumn(t, tx, "group_account_priority_operations", "request_json", "jsonb", 0, false)
+	requireColumn(t, tx, "group_account_priority_operations", "response_json", "jsonb", 0, false)
+	requireForeignKeyOnDelete(t, tx, "group_account_priority_operations", "group_id", "groups", "CASCADE")
+	requireConstraintDefinitionContains(
+		t,
+		tx,
+		"group_account_priority_operations",
+		"group_account_priority_operations_group_id_operation_id_key",
+		"UNIQUE (group_id, operation_id)",
+	)
+
 	// user_allowed_groups: created_at should be timestamptz
 	requireColumn(t, tx, "user_allowed_groups", "created_at", "timestamp with time zone", 0, false)
 }

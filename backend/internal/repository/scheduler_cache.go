@@ -61,6 +61,25 @@ end
 return updated
 `)
 
+var inspectSchedulerSnapshotScript = redis.NewScript(`
+local ready = redis.call('GET', KEYS[1])
+if ready == false then
+    return {'', ''}
+end
+
+local active = redis.call('GET', KEYS[2])
+if active == false then
+    return {ready, ''}
+end
+
+local result = {ready, active}
+local ids = redis.call('ZRANGE', KEYS[3] .. active, 0, -1)
+for _, id in ipairs(ids) do
+    table.insert(result, id)
+end
+return result
+`)
+
 var (
 	// epoch 标识 bucket writer 的代际，retired key 是持久退休标记。
 	// Capture、allocate、activate 都在 Lua 内同时校验两者：-1 表示已退休，-2 表示 epoch 无效或与 token 代际不匹配；
@@ -307,6 +326,52 @@ func (c *schedulerCache) GetSnapshot(ctx context.Context, bucket service.Schedul
 	}
 
 	return accounts, true, nil
+}
+
+func (c *schedulerCache) InspectSchedulerSnapshot(ctx context.Context, bucket service.SchedulerBucket) (service.SchedulerSnapshotInspection, error) {
+	result := service.SchedulerSnapshotInspection{Bucket: bucket}
+	snapshotKeyPrefix := fmt.Sprintf("%s%d:%s:%s:v", schedulerSnapshotPrefix, bucket.GroupID, bucket.Platform, bucket.Mode)
+	raw, err := inspectSchedulerSnapshotScript.Run(ctx, c.rdb, []string{
+		schedulerBucketKey(schedulerReadyPrefix, bucket),
+		schedulerBucketKey(schedulerActivePrefix, bucket),
+		snapshotKeyPrefix,
+	}).Slice()
+	if err != nil {
+		return result, err
+	}
+	if len(raw) < 2 {
+		return result, fmt.Errorf("inspect scheduler bucket %s returned an invalid result", bucket.String())
+	}
+	ready, ok := raw[0].(string)
+	if !ok {
+		return result, fmt.Errorf("inspect scheduler bucket %s returned an invalid ready marker", bucket.String())
+	}
+	if ready != "1" {
+		return result, nil
+	}
+	active, ok := raw[1].(string)
+	if !ok || active == "" {
+		return result, nil
+	}
+	version, err := strconv.ParseInt(active, 10, 64)
+	if err != nil || version <= 0 {
+		return result, fmt.Errorf("inspect scheduler bucket %s returned an invalid active version", bucket.String())
+	}
+	result.Ready = true
+	result.ActiveVersion = version
+	result.AccountIDs = make([]int64, 0, len(raw)-2)
+	for _, value := range raw[2:] {
+		idText, ok := value.(string)
+		if !ok {
+			return service.SchedulerSnapshotInspection{Bucket: bucket}, fmt.Errorf("inspect scheduler bucket %s returned an invalid account id", bucket.String())
+		}
+		accountID, err := strconv.ParseInt(idText, 10, 64)
+		if err != nil || accountID <= 0 {
+			return service.SchedulerSnapshotInspection{Bucket: bucket}, fmt.Errorf("inspect scheduler bucket %s returned an invalid account id", bucket.String())
+		}
+		result.AccountIDs = append(result.AccountIDs, accountID)
+	}
+	return result, nil
 }
 
 func (c *schedulerCache) CaptureBucketWriteToken(ctx context.Context, bucket service.SchedulerBucket) (service.SchedulerBucketWriteToken, error) {

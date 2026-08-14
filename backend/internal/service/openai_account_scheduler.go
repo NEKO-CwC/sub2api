@@ -290,6 +290,11 @@ type defaultOpenAIAccountScheduler struct {
 	grokFreeQuotaGateCache sync.Map // key: int64(accountID), value: grokFreeQuotaGateCacheEntry
 }
 
+func (s *defaultOpenAIAccountScheduler) groupScopedPriorityEnabled() bool {
+	return s != nil && s.service != nil && s.service.cfg != nil &&
+		s.service.cfg.Gateway.Scheduling.GroupScopedPriorityEnabled
+}
+
 type openAISelectionProbeBudget struct {
 	acquires  int
 	rechecks  int
@@ -583,9 +588,16 @@ func openAIStickyAccountMatchesGroup(account *Account, groupID *int64) bool {
 	return false
 }
 
-func openAIAccountSchedulingPriority(account *Account) int {
+func openAIAccountSchedulingPriority(account *Account, groupID *int64, groupScopedPriorityEnabled bool) int {
 	if account == nil {
 		return 0
+	}
+	if groupScopedPriorityEnabled && groupID != nil {
+		for _, accountGroup := range account.AccountGroups {
+			if accountGroup.GroupID == *groupID {
+				return accountGroup.Priority
+			}
+		}
 	}
 	return account.Priority
 }
@@ -650,8 +662,8 @@ func isOpenAIAccountCandidateBetter(left openAIAccountCandidateScore, right open
 	if left.score != right.score {
 		return left.score > right.score
 	}
-	if left.account.Priority != right.account.Priority {
-		return left.account.Priority < right.account.Priority
+	if left.priority != right.priority {
+		return left.priority < right.priority
 	}
 	if left.loadInfo.LoadRate != right.loadInfo.LoadRate {
 		return left.loadInfo.LoadRate < right.loadInfo.LoadRate
@@ -828,6 +840,7 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAIAccountLoadPlan(
 			account:   account,
 			loadInfo:  loadInfo,
 			loadKnown: loadKnown,
+			priority:  openAIAccountSchedulingPriority(account, req.GroupID, s.groupScopedPriorityEnabled()),
 			errorRate: errorRate,
 			ttft:      ttft,
 			hasTTFT:   hasTTFT,
@@ -858,7 +871,7 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAIAccountLoadPlan(
 		return plan
 	}
 
-	minPriority, maxPriority := openAIAccountSchedulingPriority(candidates[0].account), openAIAccountSchedulingPriority(candidates[0].account)
+	minPriority, maxPriority := candidates[0].priority, candidates[0].priority
 	maxWaiting := 1
 	loadRateSum := 0.0
 	loadRateSumSquares := 0.0
@@ -866,7 +879,6 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAIAccountLoadPlan(
 	hasTTFTSample := false
 	for i := range candidates {
 		candidate := &candidates[i]
-		candidate.priority = openAIAccountSchedulingPriority(candidate.account)
 		if candidate.priority < minPriority {
 			minPriority = candidate.priority
 		}
@@ -1086,8 +1098,8 @@ func sortOpenAICompactRetryCandidates(pool []openAIAccountCandidateScore) []open
 	ordered := append([]openAIAccountCandidateScore(nil), pool...)
 	sort.SliceStable(ordered, func(i, j int) bool {
 		a, b := ordered[i], ordered[j]
-		if a.account.Priority != b.account.Priority {
-			return a.account.Priority < b.account.Priority
+		if a.priority != b.priority {
+			return a.priority < b.priority
 		}
 		if a.loadInfo.LoadRate != b.loadInfo.LoadRate {
 			return a.loadInfo.LoadRate < b.loadInfo.LoadRate
@@ -2543,6 +2555,7 @@ func buildOpenAIAccountSchedulerScoreSnapshot(
 		candidates = append(candidates, openAIAccountCandidateScore{
 			account:   account,
 			loadInfo:  loadInfo,
+			priority:  openAIAccountSchedulingPriority(account, nil, false),
 			errorRate: 0,
 			ttft:      0,
 			hasTTFT:   false,
@@ -2552,11 +2565,10 @@ func buildOpenAIAccountSchedulerScoreSnapshot(
 		return nil
 	}
 
-	minPriority, maxPriority := openAIAccountSchedulingPriority(candidates[0].account), openAIAccountSchedulingPriority(candidates[0].account)
+	minPriority, maxPriority := candidates[0].priority, candidates[0].priority
 	maxWaiting := 1
 	for i := range candidates {
 		candidate := &candidates[i]
-		candidate.priority = openAIAccountSchedulingPriority(candidate.account)
 		if candidate.priority < minPriority {
 			minPriority = candidate.priority
 		}

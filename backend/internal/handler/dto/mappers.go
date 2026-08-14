@@ -268,7 +268,7 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 		SessionWindowStart:      a.SessionWindowStart,
 		SessionWindowEnd:        a.SessionWindowEnd,
 		SessionWindowStatus:     a.SessionWindowStatus,
-		GroupIDs:                a.GroupIDs,
+		GroupIDs:                append([]int64{}, a.GroupIDs...),
 		ParentAccountID:         a.ParentAccountID,
 		QuotaDimension:          a.QuotaDimension,
 	}

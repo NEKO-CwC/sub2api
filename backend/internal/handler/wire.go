@@ -257,7 +257,7 @@ var ProviderSet = wire.NewSet(
 	admin.NewRedeemHandler,
 	admin.NewPromoHandler,
 	ProvideAdminSettingHandler,
-	admin.NewOpsHandler,
+	admin.ProvideOpsHandler,
 	ProvideSystemHandler,
 	admin.NewSubscriptionHandler,
 	admin.NewUsageHandler,

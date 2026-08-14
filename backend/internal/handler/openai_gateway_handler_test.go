@@ -943,6 +943,59 @@ func TestOpenAIResponsesWebSocket_InvalidUpgradeDoesNotSetTransport(t *testing.T
 	require.Equal(t, service.OpenAIClientTransportUnknown, service.GetOpenAIClientTransport(c))
 }
 
+func TestOpenAIResponsesRejectsInvalidCanaryCorrelationBeforeRouting(t *testing.T) {
+	groupIDPtr := func(value int64) *int64 { return &value }
+	tests := []struct {
+		name       string
+		websocket  bool
+		apiKeyID   int64
+		groupID    *int64
+		values     []string
+		wantStatus int
+	}{
+		{name: "http malformed", apiKeyID: routingCanaryAPIKeyID, groupID: groupIDPtr(routingCanaryGroupID), values: []string{"not-a-nonce"}, wantStatus: http.StatusBadRequest},
+		{name: "http duplicate", apiKeyID: routingCanaryAPIKeyID, groupID: groupIDPtr(routingCanaryGroupID), values: []string{strings.Repeat("A", routingCanaryNonceEncodedLength), strings.Repeat("A", routingCanaryNonceEncodedLength)}, wantStatus: http.StatusBadRequest},
+		{name: "http wrong key", apiKeyID: 104, groupID: groupIDPtr(routingCanaryGroupID), values: []string{strings.Repeat("A", routingCanaryNonceEncodedLength)}, wantStatus: http.StatusForbidden},
+		{name: "http wrong group", apiKeyID: routingCanaryAPIKeyID, groupID: groupIDPtr(31), values: []string{strings.Repeat("A", routingCanaryNonceEncodedLength)}, wantStatus: http.StatusForbidden},
+		{name: "http nil group", apiKeyID: routingCanaryAPIKeyID, values: []string{strings.Repeat("A", routingCanaryNonceEncodedLength)}, wantStatus: http.StatusForbidden},
+		{name: "websocket malformed before upgrade", websocket: true, apiKeyID: routingCanaryAPIKeyID, groupID: groupIDPtr(routingCanaryGroupID), values: []string{"not-a-nonce"}, wantStatus: http.StatusBadRequest},
+		{name: "websocket wrong key before upgrade", websocket: true, apiKeyID: 104, groupID: groupIDPtr(routingCanaryGroupID), values: []string{strings.Repeat("A", routingCanaryNonceEncodedLength)}, wantStatus: http.StatusForbidden},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			method := http.MethodPost
+			if test.websocket {
+				method = http.MethodGet
+			}
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(method, "/openai/v1/responses", nil)
+			if test.websocket {
+				c.Request.Header.Set("Upgrade", "websocket")
+				c.Request.Header.Set("Connection", "Upgrade")
+			}
+			c.Request.Header[routingCanaryCorrelationHeader] = append([]string(nil), test.values...)
+			c.Set(string(middleware.ContextKeyAPIKey), &service.APIKey{ID: test.apiKeyID, GroupID: test.groupID})
+			c.Set(string(middleware.ContextKeyUser), middleware.AuthSubject{UserID: 1, Concurrency: 1})
+
+			h := &OpenAIGatewayHandler{}
+			if test.websocket {
+				h.ResponsesWebSocket(c)
+			} else {
+				h.Responses(c)
+			}
+
+			require.Equal(t, test.wantStatus, w.Code)
+			require.NotEqual(t, http.StatusSwitchingProtocols, w.Code)
+			require.Empty(t, c.Request.Header.Values(routingCanaryCorrelationHeader))
+			for _, value := range test.values {
+				require.NotContains(t, w.Body.String(), value)
+			}
+		})
+	}
+}
+
 func TestOpenAIResponsesWebSocket_IngressCapacityRejected(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cache := &concurrencyCacheMock{
@@ -1815,13 +1868,15 @@ type openAIWSFailoverHandlerAccountRepoStub struct {
 
 type openAIHTTPPassthroughFailoverUpstream struct {
 	service.HTTPUpstream
-	mu         sync.Mutex
-	accountIDs []int64
+	mu                 sync.Mutex
+	accountIDs         []int64
+	correlationHeaders []string
 }
 
-func (u *openAIHTTPPassthroughFailoverUpstream) Do(_ *http.Request, _ string, accountID int64, _ int) (*http.Response, error) {
+func (u *openAIHTTPPassthroughFailoverUpstream) Do(request *http.Request, _ string, accountID int64, _ int) (*http.Response, error) {
 	u.mu.Lock()
 	u.accountIDs = append(u.accountIDs, accountID)
+	u.correlationHeaders = append(u.correlationHeaders, request.Header.Get(routingCanaryCorrelationHeader))
 	u.mu.Unlock()
 	return &http.Response{
 		StatusCode: http.StatusBadGateway,
@@ -1834,6 +1889,12 @@ func (u *openAIHTTPPassthroughFailoverUpstream) calls() []int64 {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return append([]int64(nil), u.accountIDs...)
+}
+
+func (u *openAIHTTPPassthroughFailoverUpstream) observedCorrelationHeaders() []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]string(nil), u.correlationHeaders...)
 }
 
 type openAIHTTPPassthroughAuthFailoverUpstream struct {
@@ -2013,7 +2074,8 @@ func (s *openAIWSUsageHandlerChannelRepoStub) GetGroupPlatforms(ctx context.Cont
 
 func TestOpenAIResponses_APIKeyPassthroughPool5xxRetriesThenExhaustsMaxSwitches(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	groupID := int64(4203)
+	groupID := routingCanaryGroupID
+	correlationNonce := strings.Repeat("A", routingCanaryNonceEncodedLength)
 	accounts := []service.Account{
 		{
 			ID: 9910, Name: "pool-api-key", Platform: service.PlatformOpenAI,
@@ -2050,7 +2112,8 @@ func TestOpenAIResponses_APIKeyPassthroughPool5xxRetriesThenExhaustsMaxSwitches(
 	defer panel.Close()
 	cfg.Gateway.RoutingAttemptEmitter = config.GatewayRoutingAttemptEmitterConfig{
 		Enabled: true, PanelURL: panel.URL, Secret: "test-secret", Sub2APIInstanceID: 7,
-		QueueSize: 4, BatchSize: 1, FlushIntervalMS: 10, RequestTimeoutMS: 500,
+		AllowedGroupIDs: []int64{groupID},
+		QueueSize:       4, BatchSize: 1, FlushIntervalMS: 10, RequestTimeoutMS: 500,
 		ShutdownTimeoutMS: 1000,
 	}
 
@@ -2098,8 +2161,9 @@ func TestOpenAIResponses_APIKeyPassthroughPool5xxRetriesThenExhaustsMaxSwitches(
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", strings.NewReader(`{"model":"gpt-5.2","input":"hello","stream":false}`))
 	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set(routingCanaryCorrelationHeader, correlationNonce)
 	c.Set(string(middleware.ContextKeyAPIKey), &service.APIKey{
-		ID: 1803, GroupID: &groupID,
+		ID: routingCanaryAPIKeyID, GroupID: &groupID,
 		User:  &service.User{ID: 1703, Status: service.StatusActive},
 		Group: &service.Group{ID: groupID, Platform: service.PlatformOpenAI, Status: service.StatusActive},
 	})
@@ -2109,11 +2173,13 @@ func TestOpenAIResponses_APIKeyPassthroughPool5xxRetriesThenExhaustsMaxSwitches(
 	h.CloseRoutingAttemptEmitter()
 
 	require.Equal(t, []int64{9910, 9910, 9911}, upstream.calls())
+	require.Equal(t, []string{"", "", ""}, upstream.observedCorrelationHeaders())
 	require.Equal(t, http.StatusBadGateway, rec.Code)
 	require.Equal(t, "upstream_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())
 	require.Equal(t, "Upstream service temporarily unavailable", gjson.GetBytes(rec.Body.Bytes(), "error.message").String())
 	observation, ok := emitted["observation"].(map[string]any)
 	require.True(t, ok)
+	require.Equal(t, routingAttemptObservationSchemaV3, observation["schema_version"])
 	attempts, ok := observation["attempts"].([]any)
 	require.True(t, ok)
 	require.Len(t, attempts, 3)
@@ -2125,6 +2191,14 @@ func TestOpenAIResponses_APIKeyPassthroughPool5xxRetriesThenExhaustsMaxSwitches(
 	require.False(t, attempts[0].(map[string]any)["is_final"].(bool))
 	require.False(t, attempts[1].(map[string]any)["is_final"].(bool))
 	require.True(t, attempts[2].(map[string]any)["is_final"].(bool))
+	for _, attemptValue := range attempts {
+		attempt := attemptValue.(map[string]any)
+		require.Equal(t, float64(routingCanaryAPIKeyID), attempt["api_key_id"])
+		require.Equal(t, "e1b1b2d579954c11301a081b74115b84635228d1323d392be4c49789dacb0a95", attempt["correlation_sha256"])
+	}
+	emittedJSON, err := json.Marshal(emitted)
+	require.NoError(t, err)
+	require.NotContains(t, string(emittedJSON), correlationNonce)
 }
 
 func TestOpenAIResponses_APIKeyPassthroughPoolAuthFailureRetriesThenSwitchesToHealthyAccount(t *testing.T) {
@@ -2509,14 +2583,18 @@ func TestOpenAIResponsesWebSocket_FailoverOnUpstreamUsageLimitEvent(t *testing.T
 
 func TestOpenAIResponsesWebSocket_FirstOutputTimeoutWithoutDownstreamReusesClientForOneFailover(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	correlationNonce := strings.Repeat("A", routingCanaryNonceEncodedLength)
 
 	firstHitCh := make(chan []byte, 1)
 	secondHitCh := make(chan []byte, 1)
+	firstCorrelationHeaderCh := make(chan string, 1)
+	secondCorrelationHeaderCh := make(chan string, 1)
 	var firstConnections atomic.Int32
 	var secondConnections atomic.Int32
 
 	firstUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		firstConnections.Add(1)
+		firstCorrelationHeaderCh <- r.Header.Get(routingCanaryCorrelationHeader)
 		conn, err := coderws.Accept(w, r, &coderws.AcceptOptions{CompressionMode: coderws.CompressionContextTakeover})
 		if err != nil {
 			return
@@ -2539,6 +2617,7 @@ func TestOpenAIResponsesWebSocket_FirstOutputTimeoutWithoutDownstreamReusesClien
 
 	secondUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		secondConnections.Add(1)
+		secondCorrelationHeaderCh <- r.Header.Get(routingCanaryCorrelationHeader)
 		conn, err := coderws.Accept(w, r, &coderws.AcceptOptions{CompressionMode: coderws.CompressionContextTakeover})
 		if err != nil {
 			return
@@ -2570,7 +2649,7 @@ func TestOpenAIResponsesWebSocket_FirstOutputTimeoutWithoutDownstreamReusesClien
 	}))
 	defer secondUpstream.Close()
 
-	groupID := int64(4212)
+	groupID := routingCanaryGroupID
 	accounts := []service.Account{
 		{
 			ID:          9912,
@@ -2633,7 +2712,8 @@ func TestOpenAIResponsesWebSocket_FirstOutputTimeoutWithoutDownstreamReusesClien
 	defer routingPanel.Close()
 	cfg.Gateway.RoutingAttemptEmitter = config.GatewayRoutingAttemptEmitterConfig{
 		Enabled: true, PanelURL: routingPanel.URL, Secret: "test-secret", Sub2APIInstanceID: 7,
-		QueueSize: 1, BatchSize: 1, FlushIntervalMS: 10, RequestTimeoutMS: 500,
+		AllowedGroupIDs: []int64{groupID},
+		QueueSize:       1, BatchSize: 1, FlushIntervalMS: 10, RequestTimeoutMS: 500,
 		ShutdownTimeoutMS: 1000,
 	}
 
@@ -2662,7 +2742,7 @@ func TestOpenAIResponsesWebSocket_FirstOutputTimeoutWithoutDownstreamReusesClien
 	defer h.CloseRoutingAttemptEmitter()
 
 	apiKey := &service.APIKey{
-		ID:      1812,
+		ID:      routingCanaryAPIKeyID,
 		GroupID: &groupID,
 		User:    &service.User{ID: 1712, Status: service.StatusActive},
 		Group:   &service.Group{ID: groupID, Platform: service.PlatformOpenAI, Status: service.StatusActive},
@@ -2682,10 +2762,12 @@ func TestOpenAIResponsesWebSocket_FirstOutputTimeoutWithoutDownstreamReusesClien
 	defer handlerServer.Close()
 
 	dialCtx, cancelDial := context.WithTimeout(context.Background(), 3*time.Second)
+	dialHeaders := http.Header{}
+	dialHeaders.Set(routingCanaryCorrelationHeader, correlationNonce)
 	clientConn, _, err := coderws.Dial(
 		dialCtx,
 		"ws"+strings.TrimPrefix(handlerServer.URL, "http")+"/openai/v1/responses",
-		&coderws.DialOptions{CompressionMode: coderws.CompressionContextTakeover},
+		&coderws.DialOptions{HTTPHeader: dialHeaders, CompressionMode: coderws.CompressionContextTakeover},
 	)
 	cancelDial()
 	require.NoError(t, err)
@@ -2729,6 +2811,8 @@ func TestOpenAIResponsesWebSocket_FirstOutputTimeoutWithoutDownstreamReusesClien
 	}
 	require.Equal(t, int32(1), firstConnections.Load())
 	require.Equal(t, int32(1), secondConnections.Load())
+	require.Empty(t, <-firstCorrelationHeaderCh)
+	require.Empty(t, <-secondCorrelationHeaderCh)
 	require.NotContains(t, accountRepo.rateLimitedIDs, int64(9913), "healthy failover account must not be penalized")
 	h.CloseRoutingAttemptEmitter()
 	var routingObservation map[string]any
@@ -2739,6 +2823,7 @@ func TestOpenAIResponsesWebSocket_FirstOutputTimeoutWithoutDownstreamReusesClien
 	}
 	observation, ok := routingObservation["observation"].(map[string]any)
 	require.True(t, ok)
+	require.Equal(t, routingAttemptObservationSchemaV3, observation["schema_version"])
 	attempts, ok := observation["attempts"].([]any)
 	require.True(t, ok)
 	require.Len(t, attempts, 2)
@@ -2752,6 +2837,14 @@ func TestOpenAIResponsesWebSocket_FirstOutputTimeoutWithoutDownstreamReusesClien
 		attempts[0].(map[string]any)["logical_request_id"],
 		attempts[1].(map[string]any)["logical_request_id"],
 	)
+	for _, attemptValue := range attempts {
+		attempt := attemptValue.(map[string]any)
+		require.Equal(t, float64(routingCanaryAPIKeyID), attempt["api_key_id"])
+		require.Equal(t, "e1b1b2d579954c11301a081b74115b84635228d1323d392be4c49789dacb0a95", attempt["correlation_sha256"])
+	}
+	routingObservationJSON, err := json.Marshal(routingObservation)
+	require.NoError(t, err)
+	require.NotContains(t, string(routingObservationJSON), correlationNonce)
 }
 
 func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSUsageLogCase) openAIResponsesWSUsageLogResult {
