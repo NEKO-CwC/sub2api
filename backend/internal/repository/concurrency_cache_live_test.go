@@ -71,3 +71,42 @@ func TestLiveLeaseExpiresWithoutRefresh(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, refreshed)
 }
+
+func TestFailoverHandoffAcquireReturnsAtomicPairSnapshot(t *testing.T) {
+	redisServer := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+	regular := NewConcurrencyCache(client, 15, 900)
+	handoff, ok := regular.(service.AccountSlotHandoffCache)
+	require.True(t, ok)
+	ctx := context.Background()
+
+	acquired, err := regular.AcquireAccountSlot(ctx, 101, 2, "primary-released")
+	require.NoError(t, err)
+	require.True(t, acquired)
+	require.NoError(t, regular.ReleaseAccountSlot(ctx, 101, "primary-released"))
+
+	result, err := handoff.AcquireAccountSlotWithHandoff(ctx, 101, 202, 2, "fallback-after-release")
+	require.NoError(t, err)
+	require.True(t, result.Acquired)
+	require.Positive(t, result.RedisUnix)
+	require.Zero(t, result.PredecessorConcurrency)
+	require.Equal(t, 1, result.FallbackConcurrency)
+
+	acquired, err = regular.AcquireAccountSlot(ctx, 303, 2, "primary-still-active")
+	require.NoError(t, err)
+	require.True(t, acquired)
+	result, err = handoff.AcquireAccountSlotWithHandoff(ctx, 303, 404, 2, "fallback-with-overlap")
+	require.NoError(t, err)
+	require.True(t, result.Acquired)
+	require.Equal(t, 1, result.PredecessorConcurrency)
+	require.Equal(t, 1, result.FallbackConcurrency)
+
+	acquired, err = regular.AcquireAccountSlot(ctx, 505, 1, "fallback-full")
+	require.NoError(t, err)
+	require.True(t, acquired)
+	result, err = handoff.AcquireAccountSlotWithHandoff(ctx, 303, 505, 1, "fallback-blocked")
+	require.NoError(t, err)
+	require.False(t, result.Acquired)
+	require.Equal(t, 1, result.PredecessorConcurrency)
+	require.Equal(t, 1, result.FallbackConcurrency)
+}

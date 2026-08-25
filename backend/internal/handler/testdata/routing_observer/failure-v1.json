@@ -1,0 +1,32 @@
+{
+  "contract_version": "routing-failure-fixture.v1",
+  "scope": {
+    "sub2api_instance_id": 1,
+    "group_id": 31,
+    "canonical_model": "gpt-5.6-sol",
+    "route_version": 12,
+    "scope_revision": 7
+  },
+  "items": [
+    {"fixture_id":"pre-001","category":"pre_upstream","api_key_id":301,"model":"gpt-5.6-sol","status_code":400,"expected":"ignored"},
+    {"fixture_id":"unmanaged-001","category":"unmanaged_model","api_key_id":301,"model":"gpt-5.6-luna","status_code":400,"expected":"ignored"},
+    {"fixture_id":"unmanaged-002","category":"unmanaged_model","api_key_id":302,"model":"gpt-5.6-luna","status_code":400,"expected":"ignored"},
+    {"fixture_id":"unmanaged-003","category":"unmanaged_model","api_key_id":303,"model":"gpt-5.6-luna","status_code":400,"expected":"ignored"},
+    {"fixture_id":"unmanaged-004","category":"unmanaged_model","api_key_id":304,"model":"gpt-5.6-luna","status_code":400,"expected":"ignored"},
+    {"fixture_id":"unmanaged-005","category":"unmanaged_model","api_key_id":305,"model":"gpt-5.6-luna","status_code":400,"expected":"ignored"},
+    {"fixture_id":"unmanaged-006","category":"unmanaged_model","api_key_id":306,"model":"gpt-5.6-luna","status_code":400,"expected":"ignored"},
+    {"fixture_id":"unmanaged-007","category":"unmanaged_model","api_key_id":307,"model":"gpt-5.6-luna","status_code":400,"expected":"ignored"},
+    {"fixture_id":"unmanaged-008","category":"unmanaged_model","api_key_id":308,"model":"gpt-5.6-luna","status_code":400,"expected":"ignored"},
+    {"fixture_id":"monitor-001","category":"monitor","api_key_id":201,"model":"gpt-5.5","status_code":524,"expected":"ignored"},
+    {"fixture_id":"monitor-002","category":"monitor","api_key_id":202,"model":"gpt-5.5","status_code":524,"expected":"ignored"},
+    {"fixture_id":"monitor-003","category":"monitor","api_key_id":203,"model":"gpt-5.5","status_code":524,"expected":"ignored"},
+    {"fixture_id":"monitor-004","category":"monitor","api_key_id":204,"model":"gpt-5.5","status_code":400,"expected":"ignored"},
+    {"fixture_id":"monitor-005","category":"monitor","api_key_id":205,"model":"gpt-5.6-sol","status_code":502,"expected":"ignored"},
+    {"fixture_id":"monitor-006","category":"monitor","api_key_id":206,"model":"gpt-5.6-sol","status_code":400,"expected":"ignored"},
+    {"fixture_id":"monitor-007","category":"monitor","api_key_id":207,"model":"gpt-5.6-sol","status_code":524,"expected":"ignored"},
+    {"fixture_id":"monitor-008","category":"monitor","api_key_id":208,"model":"gpt-5.6-sol","status_code":400,"expected":"ignored"},
+    {"fixture_id":"eligible-001","category":"managed_user_upstream","api_key_id":301,"model":"gpt-5.6-sol","status_code":429,"expected":"eligible"},
+    {"fixture_id":"eligible-002","category":"managed_user_upstream","api_key_id":301,"model":"gpt-5.6-sol","status_code":524,"expected":"eligible"},
+    {"fixture_id":"eligible-003","category":"managed_user_upstream","api_key_id":301,"model":"gpt-5.6-sol","status_code":524,"expected":"eligible"}
+  ]
+}

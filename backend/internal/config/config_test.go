@@ -184,6 +184,82 @@ func TestValidateRoutingAttemptEmitterBounds(t *testing.T) {
 	}
 }
 
+func TestLoadRoutingObserverEnvironmentAndDefaults(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_ENABLED", "true")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_PANEL_URL", "https://panel.example.test")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_SECRET", "test-secret-0123456789")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_SUB2API_INSTANCE_ID", "7")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_DATA_DIR", "/tmp/routing-observer-test")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.Equal(t, GatewayRoutingObserverConfig{
+		Enabled: true, PanelURL: "https://panel.example.test", Secret: "test-secret-0123456789",
+		Sub2APIInstanceID: 7, DataDir: "/tmp/routing-observer-test", QueueSize: 256,
+		RequestTimeoutMS: 1000, ShutdownTimeoutMS: 5000, MaxScopes: 64,
+		MaxAccountsPerScope: 32, MaxRulesPerPolicy: 16, MaxAttemptsPerRequest: 64,
+		MaxPendingOutbox: 64,
+	}, cfg.Gateway.RoutingObserver)
+}
+
+func TestRoutingObserverAndLegacyEmitterAreMutuallyExclusive(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_ENABLED", "true")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_PANEL_URL", "https://panel.example.test")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_SECRET", "legacy-secret")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_SUB2API_INSTANCE_ID", "7")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_ALLOWED_GROUP_IDS", "31")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_ENABLED", "true")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_PANEL_URL", "https://panel.example.test")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_SECRET", "observer-secret")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_SUB2API_INSTANCE_ID", "7")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_DATA_DIR", "/tmp/routing-observer-test")
+
+	_, err := Load()
+	require.ErrorContains(t, err, "cannot both be enabled")
+}
+
+func TestRoutingObserverRejectsSecretTooShortForDomainSeparatedIdentity(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_ENABLED", "true")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_PANEL_URL", "https://panel.example.test")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_SECRET", "short")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_SUB2API_INSTANCE_ID", "7")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_DATA_DIR", "/tmp/routing-observer-test")
+
+	_, err := Load()
+	require.ErrorContains(t, err, "at least 16 bytes")
+}
+
+func TestValidateRoutingObserverBounds(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*GatewayRoutingObserverConfig)
+		want      string
+	}{
+		{"queue", func(c *GatewayRoutingObserverConfig) { c.QueueSize = GatewayRoutingObserverMaxQueueSize + 1 }, "queue_size"},
+		{"request timeout", func(c *GatewayRoutingObserverConfig) { c.RequestTimeoutMS = 0 }, "request_timeout_ms"},
+		{"shutdown timeout", func(c *GatewayRoutingObserverConfig) {
+			c.ShutdownTimeoutMS = GatewayRoutingObserverMaxShutdownTimeoutMS + 1
+		}, "shutdown_timeout_ms"},
+		{"scopes", func(c *GatewayRoutingObserverConfig) { c.MaxScopes = GatewayRoutingObserverMaxScopes + 1 }, "max_scopes"},
+		{"accounts", func(c *GatewayRoutingObserverConfig) { c.MaxAccountsPerScope = 0 }, "max_accounts_per_scope"},
+		{"rules", func(c *GatewayRoutingObserverConfig) { c.MaxRulesPerPolicy = 0 }, "max_rules_per_policy"},
+		{"attempts", func(c *GatewayRoutingObserverConfig) { c.MaxAttemptsPerRequest = 0 }, "max_attempts_per_request"},
+		{"outbox", func(c *GatewayRoutingObserverConfig) { c.MaxPendingOutbox = 0 }, "max_pending_outbox"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resetViperWithJWTSecret(t)
+			cfg, err := Load()
+			require.NoError(t, err)
+			test.configure(&cfg.Gateway.RoutingObserver)
+			require.ErrorContains(t, cfg.Validate(), test.want)
+		})
+	}
+}
+
 func TestNormalizeForwardedClientIPHeaders(t *testing.T) {
 	headers, err := NormalizeForwardedClientIPHeaders([]string{
 		" x-cdn-client-ip ",

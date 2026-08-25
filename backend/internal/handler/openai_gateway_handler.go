@@ -44,6 +44,7 @@ type OpenAIGatewayHandler struct {
 	maxAccountSwitches         int
 	cfg                        *config.Config
 	routingAttemptEmitter      *RoutingAttemptEmitter
+	routingObserver            *RoutingObserver
 }
 
 type openAIWSTurnChannelMappingSnapshot struct {
@@ -292,6 +293,7 @@ func NewOpenAIGatewayHandler(
 		maxAccountSwitches:       maxAccountSwitches,
 		cfg:                      cfg,
 		routingAttemptEmitter:    NewRoutingAttemptEmitter(gatewayRoutingAttemptEmitterConfig(cfg)),
+		routingObserver:          NewRoutingObserver(gatewayRoutingObserverConfig(cfg)),
 	}
 }
 
@@ -302,9 +304,22 @@ func gatewayRoutingAttemptEmitterConfig(cfg *config.Config) config.GatewayRoutin
 	return cfg.Gateway.RoutingAttemptEmitter
 }
 
+func gatewayRoutingObserverConfig(cfg *config.Config) config.GatewayRoutingObserverConfig {
+	if cfg == nil {
+		return config.GatewayRoutingObserverConfig{}
+	}
+	return cfg.Gateway.RoutingObserver
+}
+
 func (h *OpenAIGatewayHandler) CloseRoutingAttemptEmitter() {
 	if h != nil && h.routingAttemptEmitter != nil {
 		h.routingAttemptEmitter.Close()
+	}
+}
+
+func (h *OpenAIGatewayHandler) CloseRoutingObserver() {
+	if h != nil && h.routingObserver != nil {
+		h.routingObserver.Close()
 	}
 }
 
@@ -332,7 +347,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		h.errorResponse(c, http.StatusInternalServerError, "api_error", "User context not found")
 		return
 	}
-	routingCorrelation, correlationStatus, correlationErr := consumeRoutingAttemptCorrelation(c.Request, apiKey)
+	routingCorrelation, correlationStatus, correlationErr := consumeRoutingGatewayCorrelation(c.Request, apiKey, h.routingObserver)
 	if correlationErr != nil {
 		h.errorResponse(c, correlationStatus, "invalid_request_error", correlationErr.Error())
 		return
@@ -558,6 +573,14 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	}
 	routingRecorder := newRoutingAttemptRecorder(h.routingAttemptEmitter, groupID, reqModel, routingCorrelation)
 	defer routingRecorder.finish()
+	routingObserverRecorder := newRoutingObserverRecorder(h.routingObserver, groupID, reqModel, apiKey.ID, routingCorrelation)
+	var routingHandoffTracker *service.AccountSlotHandoffTracker
+	if routingObserverRecorder != nil {
+		routingHandoffTracker = service.NewAccountSlotHandoffTracker()
+		c.Request = c.Request.WithContext(service.ContextWithAccountSlotHandoffTracker(c.Request.Context(), routingHandoffTracker))
+		defer routingHandoffTracker.ClearPredecessor()
+	}
+	defer finishRoutingObserverRecorderIfClientPresent(c, routingObserverRecorder)
 
 	// 生图意图的 /v1/responses 请求必须调度到确实支持 Responses API 的账号，否则
 	// 会在 forward 阶段被静默降级为无法生图的 Chat Completions 直转（#4417）。
@@ -688,6 +711,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		if slotResult != openAISlotAcquireOK {
 			return
 		}
+		routingObserverRecorder.captureHandoff(routingHandoffTracker, account.ID)
 
 		// Forward request
 		service.SetOpsLatencyMs(c, service.OpsRoutingLatencyMsKey, time.Since(routingStart).Milliseconds())
@@ -708,6 +732,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			return h.gatewayService.Forward(c.Request.Context(), c, account, attemptBody)
 		}()
 		recordRoutingAttemptIfClientPresent(c, routingRecorder, account.ID, result, err, time.Now())
+		recordRoutingObserverAttemptIfClientPresent(c, routingObserverRecorder, account.ID, result, err, time.Now())
 		var cyberBlockBodyHTTP []byte
 		if service.GetOpsCyberPolicy(c) != nil {
 			cyberBlockBodyHTTP = sessionHashBody
@@ -837,6 +862,9 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 					if h.gatewayService.ShouldStopOpenAIOAuth429Failover(account, failoverErr.StatusCode, switchCount, &oauth429FailoverState) {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
+					}
+					if predecessorID := routingObserverRecorder.prepareFailover(account.ID, failoverErr); predecessorID > 0 && routingHandoffTracker != nil {
+						routingHandoffTracker.SetPredecessor(predecessorID)
 					}
 					failoverSwitchFields := []zap.Field{
 						zap.Int64("account_id", account.ID),
@@ -1807,7 +1835,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		h.errorResponse(c, http.StatusInternalServerError, "api_error", "User context not found")
 		return
 	}
-	routingCorrelation, correlationStatus, correlationErr := consumeRoutingAttemptCorrelation(c.Request, apiKey)
+	routingCorrelation, correlationStatus, correlationErr := consumeRoutingGatewayCorrelation(c.Request, apiKey, h.routingObserver)
 	if correlationErr != nil {
 		h.errorResponse(c, correlationStatus, "invalid_request_error", correlationErr.Error())
 		return
@@ -1916,6 +1944,11 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	}
 	wsRoutingRecorder := newRoutingAttemptWebSocketRecorder(h.routingAttemptEmitter, groupID, reqModel, routingCorrelation)
 	defer wsRoutingRecorder.finish()
+	wsRoutingObserverRecorder := newRoutingObserverWebSocketRecorder(h.routingObserver, groupID, reqModel, apiKey.ID, routingCorrelation)
+	if wsRoutingObserverRecorder != nil {
+		c.Request = c.Request.WithContext(service.ContextWithAccountSlotHandoffTracker(c.Request.Context(), wsRoutingObserverRecorder.handoffTracker()))
+	}
+	defer finishRoutingObserverWebSocketRecorderIfClientPresent(c, wsRoutingObserverRecorder)
 	ensureCompositeTargetPlatform(c, apiKey, reqModel)
 	ctx = c.Request.Context()
 	if apiKey.Group != nil && apiKey.Group.Platform == service.PlatformComposite {
@@ -2108,6 +2141,9 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			closeOpenAIWSFailoverExhausted(c, wsConn, failoverErr)
 			return false
 		}
+		if predecessorID := wsRoutingObserverRecorder.prepareFailover(account.ID, failoverErr); predecessorID > 0 {
+			wsRoutingObserverRecorder.handoffTracker().SetPredecessor(predecessorID)
+		}
 		reqLog.Warn("openai.websocket_upstream_failover_switching",
 			zap.Int64("account_id", account.ID),
 			zap.Int("upstream_status", failoverErr.StatusCode),
@@ -2247,6 +2283,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		// captured by the previous failover account before credential lookup.
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 		currentAccountRelease = wrapReleaseOnDone(ctx, accountReleaseFunc)
+		wsRoutingObserverRecorder.captureHandoff(account.ID)
 		if err := h.gatewayService.BindStickySessionAfterProfitAdmission(ctx, apiKey.GroupID, sessionHash, account.ID); err != nil {
 			reqLog.Warn("openai.websocket_bind_sticky_session_after_profit_admission_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 		}
@@ -2397,6 +2434,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			},
 			AfterTurn: func(turn int, result *service.OpenAIForwardResult, turnErr error) {
 				recordRoutingWebSocketAttemptIfClientPresent(c, wsRoutingRecorder, turn, account.ID, result, turnErr, time.Now())
+				recordRoutingObserverWebSocketAttemptIfClientPresent(c, wsRoutingObserverRecorder, turn, account.ID, result, turnErr, time.Now())
 				turnStart := getTurnStart(turn)
 				cyberBlockBody := takeCyberTurnBody(turn)
 				// F1: cyber 标记按 turn 生命周期清理——defer 保证任意早返回路径都执行；

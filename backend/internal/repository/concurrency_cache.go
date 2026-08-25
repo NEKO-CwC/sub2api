@@ -106,6 +106,45 @@ var (
 		return {0, now}
 	`)
 
+	// acquireAccountHandoffScript acquires the fallback slot and returns the
+	// predecessor/fallback counts from the same Redis execution window.
+	// KEYS[1..2] are fallback regular/live slots; KEYS[3..4] are predecessor
+	// regular/live slots. The fallback count is captured after a successful add.
+	acquireAccountHandoffScript = redis.NewScript(`
+		redis.replicate_commands()
+		local fallbackKey = KEYS[1]
+		local fallbackLiveKey = KEYS[2]
+		local predecessorKey = KEYS[3]
+		local predecessorLiveKey = KEYS[4]
+		local maxConcurrency = tonumber(ARGV[1])
+		local ttl = tonumber(ARGV[2])
+		local requestID = ARGV[3]
+		local now = tonumber(redis.call('TIME')[1])
+		local expireBefore = now - ttl
+
+		redis.call('ZREMRANGEBYSCORE', fallbackKey, '-inf', expireBefore)
+		redis.call('ZREMRANGEBYSCORE', fallbackLiveKey, '-inf', now - 60)
+		redis.call('ZREMRANGEBYSCORE', predecessorKey, '-inf', expireBefore)
+		redis.call('ZREMRANGEBYSCORE', predecessorLiveKey, '-inf', now - 60)
+
+		local predecessorCount = redis.call('ZCARD', predecessorKey) + redis.call('ZCARD', predecessorLiveKey)
+		local fallbackCount = redis.call('ZCARD', fallbackKey) + redis.call('ZCARD', fallbackLiveKey)
+		local exists = redis.call('ZSCORE', fallbackKey, requestID)
+		if exists ~= false then
+			redis.call('ZADD', fallbackKey, now, requestID)
+			redis.call('EXPIRE', fallbackKey, ttl)
+			fallbackCount = redis.call('ZCARD', fallbackKey) + redis.call('ZCARD', fallbackLiveKey)
+			return {1, now, predecessorCount, fallbackCount}
+		end
+		if fallbackCount < maxConcurrency then
+			redis.call('ZADD', fallbackKey, now, requestID)
+			redis.call('EXPIRE', fallbackKey, ttl)
+			fallbackCount = fallbackCount + 1
+			return {1, now, predecessorCount, fallbackCount}
+		end
+		return {0, now, predecessorCount, fallbackCount}
+	`)
+
 	// getCountScript 统计有序集合中的槽位数量并清理过期条目
 	// 使用 Redis TIME 命令获取服务器时间
 	// KEYS[1] = 普通槽位键，KEYS[2] = 对应 Live 槽位键
@@ -640,6 +679,41 @@ func (c *concurrencyCache) AcquireAccountSlot(ctx context.Context, accountID int
 		c.touchActiveIndexAt(ctx, accountActiveIndexKey, accountID, now+int64(c.slotTTLSeconds))
 	}
 	return result == 1, nil
+}
+
+func (c *concurrencyCache) AcquireAccountSlotWithHandoff(
+	ctx context.Context,
+	predecessorAccountID int64,
+	fallbackAccountID int64,
+	maxConcurrency int,
+	requestID string,
+) (service.AccountSlotHandoffAcquireResult, error) {
+	if predecessorAccountID <= 0 || fallbackAccountID <= 0 || predecessorAccountID == fallbackAccountID || maxConcurrency <= 0 || requestID == "" {
+		return service.AccountSlotHandoffAcquireResult{}, errors.New("account slot handoff acquire input is invalid")
+	}
+	raw, err := acquireAccountHandoffScript.Run(ctx, c.rdb, []string{
+		accountSlotKey(fallbackAccountID), liveAccountSlotKey(fallbackAccountID),
+		accountSlotKey(predecessorAccountID), liveAccountSlotKey(predecessorAccountID),
+	}, maxConcurrency, c.slotTTLSeconds, requestID).Result()
+	if err != nil {
+		return service.AccountSlotHandoffAcquireResult{}, err
+	}
+	values := [4]int64{}
+	for index := range values {
+		value, parseErr := redisScriptInt64At(raw, index)
+		if parseErr != nil {
+			return service.AccountSlotHandoffAcquireResult{}, fmt.Errorf("parse handoff script value %d: %w", index, parseErr)
+		}
+		values[index] = value
+	}
+	result := service.AccountSlotHandoffAcquireResult{
+		Acquired: values[0] == 1, RedisUnix: values[1],
+		PredecessorConcurrency: int(values[2]), FallbackConcurrency: int(values[3]),
+	}
+	if result.Acquired {
+		c.touchActiveIndexAt(ctx, accountActiveIndexKey, fallbackAccountID, result.RedisUnix+int64(c.slotTTLSeconds))
+	}
+	return result, nil
 }
 
 func (c *concurrencyCache) ReleaseAccountSlot(ctx context.Context, accountID int64, requestID string) error {

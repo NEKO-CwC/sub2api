@@ -321,7 +321,10 @@ func newOpenAIUpstreamFailoverError(
 		failoverErr.ClientStatusCode = http.StatusServiceUnavailable
 		failoverErr.ClientMessage = openAICapacityShedClientMessage(upstreamMsg, responseBody)
 	}
-	return failoverErr
+	if requestScopedCapacity {
+		return typedOpenAIFailover(failoverErr, GatewayFailureScopeRequest, openAIRequestScopedFailureReason)
+	}
+	return typedOpenAIFailover(failoverErr, GatewayFailureScopeAccount, openAIUpstreamResponseFailureReason)
 }
 
 func (s *OpenAIGatewayService) newOpenAIAccountFailoverError(
@@ -630,11 +633,11 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 		Detail:             upstreamDetail,
 	})
 	if shouldDisable {
-		return nil, &UpstreamFailoverError{
+		return nil, typedOpenAIFailover(&UpstreamFailoverError{
 			StatusCode:             resp.StatusCode,
 			ResponseBody:           body,
 			RetryableOnSameAccount: false,
-		}
+		}, GatewayFailureScopeAccount, openAIUpstreamResponseFailureReason)
 	}
 
 	MarkResponseCommitted(c)
@@ -825,11 +828,11 @@ func (s *OpenAIGatewayService) handleCompatErrorResponse(
 		Detail:             upstreamDetail,
 	})
 	if shouldDisable {
-		return nil, &UpstreamFailoverError{
+		return nil, typedOpenAIFailover(&UpstreamFailoverError{
 			StatusCode:             resp.StatusCode,
 			ResponseBody:           body,
 			RetryableOnSameAccount: false,
-		}
+		}, GatewayFailureScopeAccount, openAIUpstreamResponseFailureReason)
 	}
 
 	MarkResponseCommitted(c)

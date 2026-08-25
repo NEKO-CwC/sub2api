@@ -73,9 +73,9 @@ func newGrokMissingUsageFailoverError(c *gin.Context, account *Account, upstream
 	if requestID := strings.TrimSpace(upstreamRequestID); requestID != "" {
 		headers.Set("x-request-id", requestID)
 	}
-	return &UpstreamFailoverError{
+	return typedOpenAIFailover(&UpstreamFailoverError{
 		StatusCode:      http.StatusBadGateway,
 		ResponseBody:    body,
 		ResponseHeaders: headers,
-	}
+	}, GatewayFailureScopeAccount, openAIUsageIntegrityFailureReason)
 }

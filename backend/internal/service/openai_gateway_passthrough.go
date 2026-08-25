@@ -1679,6 +1679,9 @@ func (s *OpenAIGatewayService) newOpenAIStreamFailoverError(
 	})
 	retryableOnSameAccount := openAIStreamFailedEventRetryableOnSameAccount(account, payload, message)
 	failoverErr := s.newOpenAIAccountFailoverError(account, statusCode, headers, payload, message, shouldDisable, retryableOnSameAccount)
+	if failoverErr.Reason == openAIUpstreamResponseFailureReason {
+		failoverErr.Reason = openAIStreamFailureReason
+	}
 	if failoverErr.IsCredentialFailure() || failoverErr.RequestScopedTransient {
 		return failoverErr
 	}

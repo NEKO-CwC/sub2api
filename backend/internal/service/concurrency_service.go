@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"sync"
@@ -53,6 +54,139 @@ type ConcurrencyCache interface {
 
 	// 启动时清理旧进程遗留槽位与等待计数
 	CleanupStaleProcessSlots(ctx context.Context, activeRequestPrefix string) error
+}
+
+// AccountSlotHandoffCache is an optional capability implemented by the Redis
+// cache. It acquires the fallback slot and snapshots both predecessor and
+// fallback counts in the same atomic operation.
+type AccountSlotHandoffCache interface {
+	AcquireAccountSlotWithHandoff(
+		ctx context.Context,
+		predecessorAccountID int64,
+		fallbackAccountID int64,
+		maxConcurrency int,
+		requestID string,
+	) (AccountSlotHandoffAcquireResult, error)
+}
+
+type AccountSlotHandoffAcquireResult struct {
+	Acquired               bool
+	PredecessorConcurrency int
+	FallbackConcurrency    int
+	RedisUnix              int64
+}
+
+type AccountSlotHandoffEvidence struct {
+	PredecessorAccountID   int64
+	FallbackAccountID      int64
+	PredecessorConcurrency int
+	FallbackConcurrency    int
+	WindowIdentity         string
+	ObservedAt             time.Time
+	Complete               bool
+	ReasonCode             string
+}
+
+type accountSlotHandoffContextKeyType struct{}
+
+var accountSlotHandoffContextKey accountSlotHandoffContextKeyType
+
+// AccountSlotHandoffTracker is request-local and bounded. A handler freezes the
+// original predecessor before selecting a new account; every acquire path then
+// records its result here without changing scheduler APIs.
+type AccountSlotHandoffTracker struct {
+	mu          sync.Mutex
+	generation  uint64
+	predecessor int64
+	evidence    map[int64]AccountSlotHandoffEvidence
+}
+
+func NewAccountSlotHandoffTracker() *AccountSlotHandoffTracker {
+	return &AccountSlotHandoffTracker{evidence: make(map[int64]AccountSlotHandoffEvidence)}
+}
+
+func ContextWithAccountSlotHandoffTracker(ctx context.Context, tracker *AccountSlotHandoffTracker) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if tracker == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, accountSlotHandoffContextKey, tracker)
+}
+
+func AccountSlotHandoffTrackerFromContext(ctx context.Context) (*AccountSlotHandoffTracker, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	tracker, ok := ctx.Value(accountSlotHandoffContextKey).(*AccountSlotHandoffTracker)
+	return tracker, ok && tracker != nil
+}
+
+func (t *AccountSlotHandoffTracker) SetPredecessor(accountID int64) bool {
+	if t == nil || accountID <= 0 {
+		return false
+	}
+	t.mu.Lock()
+	t.generation++
+	t.predecessor = accountID
+	t.evidence = make(map[int64]AccountSlotHandoffEvidence)
+	t.mu.Unlock()
+	return true
+}
+
+// ClearPredecessor closes the current failover generation. Long-lived callers
+// (notably WebSocket sessions) must call it once a turn reaches a terminal
+// account so later ordinary reacquires cannot inherit stale handoff state.
+func (t *AccountSlotHandoffTracker) ClearPredecessor() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.generation++
+	t.predecessor = 0
+	t.evidence = make(map[int64]AccountSlotHandoffEvidence)
+	t.mu.Unlock()
+}
+
+func (t *AccountSlotHandoffTracker) requestFor(fallbackAccountID int64) (int64, uint64, bool) {
+	if t == nil || fallbackAccountID <= 0 {
+		return 0, 0, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.predecessor <= 0 || t.predecessor == fallbackAccountID {
+		return 0, 0, false
+	}
+	return t.predecessor, t.generation, true
+}
+
+func (t *AccountSlotHandoffTracker) record(generation uint64, evidence AccountSlotHandoffEvidence) {
+	if t == nil || evidence.FallbackAccountID <= 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if generation != t.generation || evidence.PredecessorAccountID != t.predecessor {
+		return
+	}
+	if _, exists := t.evidence[evidence.FallbackAccountID]; !exists && len(t.evidence) >= 64 {
+		return
+	}
+	t.evidence[evidence.FallbackAccountID] = evidence
+}
+
+func (t *AccountSlotHandoffTracker) Take(fallbackAccountID int64) (AccountSlotHandoffEvidence, bool) {
+	if t == nil || fallbackAccountID <= 0 {
+		return AccountSlotHandoffEvidence{}, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	evidence, ok := t.evidence[fallbackAccountID]
+	if ok {
+		delete(t.evidence, fallbackAccountID)
+	}
+	return evidence, ok
 }
 
 type APIKeyConcurrencyCache interface {
@@ -310,6 +444,7 @@ func (s *ConcurrencyService) SetAccountLoadBatchCacheTTL(ttl time.Duration) {
 type AcquireResult struct {
 	Acquired    bool
 	ReleaseFunc func() // Must be called when done (typically via defer)
+	Handoff     *AccountSlotHandoffEvidence
 }
 
 type AccountWithConcurrency struct {
@@ -340,25 +475,75 @@ type UserLoadInfo struct {
 // If the account is at max concurrency, it waits until a slot is available or timeout.
 // Returns a release function that MUST be called when the request completes.
 func (s *ConcurrencyService) AcquireAccountSlot(ctx context.Context, accountID int64, maxConcurrency int) (*AcquireResult, error) {
+	tracker, tracking := AccountSlotHandoffTrackerFromContext(ctx)
+	predecessorID, generation, handoffRequested := int64(0), uint64(0), false
+	if tracking {
+		predecessorID, generation, handoffRequested = tracker.requestFor(accountID)
+	}
 	// If maxConcurrency is 0 or negative, no limit
 	if maxConcurrency <= 0 {
+		var handoff *AccountSlotHandoffEvidence
+		if handoffRequested {
+			evidence := AccountSlotHandoffEvidence{
+				PredecessorAccountID: predecessorID, FallbackAccountID: accountID,
+				PredecessorConcurrency: -1, FallbackConcurrency: -1,
+				ObservedAt: time.Now().UTC(), Complete: false, ReasonCode: "unlimited_slot_no_atomic_snapshot",
+			}
+			handoff = &evidence
+			tracker.record(generation, evidence)
+		}
 		return &AcquireResult{
 			Acquired:    true,
 			ReleaseFunc: func() {}, // no-op
+			Handoff:     handoff,
 		}, nil
 	}
 
 	// Generate unique request ID for this slot
 	requestID := generateRequestID()
 
-	acquired, err := s.cache.AcquireAccountSlot(ctx, accountID, maxConcurrency, requestID)
-	if err != nil {
-		return nil, err
+	var acquired bool
+	var handoff *AccountSlotHandoffEvidence
+	if handoffRequested {
+		if cache, ok := s.cache.(AccountSlotHandoffCache); ok {
+			result, err := cache.AcquireAccountSlotWithHandoff(ctx, predecessorID, accountID, maxConcurrency, requestID)
+			if err != nil {
+				return nil, err
+			}
+			acquired = result.Acquired
+			if acquired {
+				evidence := newAccountSlotHandoffEvidence(predecessorID, accountID, requestID, result)
+				handoff = &evidence
+				tracker.record(generation, evidence)
+			}
+		} else {
+			var err error
+			acquired, err = s.cache.AcquireAccountSlot(ctx, accountID, maxConcurrency, requestID)
+			if err != nil {
+				return nil, err
+			}
+			if acquired {
+				evidence := AccountSlotHandoffEvidence{
+					PredecessorAccountID: predecessorID, FallbackAccountID: accountID,
+					PredecessorConcurrency: -1, FallbackConcurrency: -1,
+					ObservedAt: time.Now().UTC(), Complete: false, ReasonCode: "atomic_handoff_cache_unsupported",
+				}
+				handoff = &evidence
+				tracker.record(generation, evidence)
+			}
+		}
+	} else {
+		var err error
+		acquired, err = s.cache.AcquireAccountSlot(ctx, accountID, maxConcurrency, requestID)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if acquired {
 		return &AcquireResult{
 			Acquired: true,
+			Handoff:  handoff,
 			ReleaseFunc: func() {
 				bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
@@ -373,6 +558,22 @@ func (s *ConcurrencyService) AcquireAccountSlot(ctx context.Context, accountID i
 		Acquired:    false,
 		ReleaseFunc: nil,
 	}, nil
+}
+
+func newAccountSlotHandoffEvidence(predecessorID, fallbackID int64, requestID string, result AccountSlotHandoffAcquireResult) AccountSlotHandoffEvidence {
+	value := fmt.Sprintf("%d\x00%d\x00%s\x00%d", predecessorID, fallbackID, requestID, result.RedisUnix)
+	digest := sha256.Sum256([]byte("account-slot-handoff.v1\x00" + value))
+	evidence := AccountSlotHandoffEvidence{
+		PredecessorAccountID: predecessorID, FallbackAccountID: fallbackID,
+		PredecessorConcurrency: result.PredecessorConcurrency, FallbackConcurrency: result.FallbackConcurrency,
+		WindowIdentity: "sha256:" + hex.EncodeToString(digest[:]),
+		ObservedAt:     time.Unix(result.RedisUnix, 0).UTC(), Complete: true,
+	}
+	if result.RedisUnix <= 0 || result.PredecessorConcurrency < 0 || result.FallbackConcurrency < 0 {
+		evidence.Complete = false
+		evidence.ReasonCode = "atomic_handoff_snapshot_invalid"
+	}
+	return evidence
 }
 
 // AcquireUserSlot attempts to acquire a concurrency slot for a user.

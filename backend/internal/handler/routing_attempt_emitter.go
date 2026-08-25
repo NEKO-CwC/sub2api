@@ -80,33 +80,65 @@ var (
 )
 
 func consumeRoutingAttemptCorrelation(request *http.Request, apiKey *service.APIKey) (routingAttemptCorrelation, int, error) {
-	if request == nil {
-		return routingAttemptCorrelation{}, 0, nil
-	}
-	values := request.Header.Values(routingCanaryCorrelationHeader)
-	request.Header.Del(routingCanaryCorrelationHeader)
-	if len(values) == 0 {
-		return routingAttemptCorrelation{}, 0, nil
-	}
-	if len(values) != 1 {
-		return routingAttemptCorrelation{}, http.StatusBadRequest, errRoutingCanaryCorrelationMalformed
-	}
-	nonce := values[0]
-	if len(nonce) != routingCanaryNonceEncodedLength {
-		return routingAttemptCorrelation{}, http.StatusBadRequest, errRoutingCanaryCorrelationMalformed
-	}
-	decoded, err := base64.RawURLEncoding.DecodeString(nonce)
-	if err != nil || len(decoded) != routingCanaryNonceDecodedLength || base64.RawURLEncoding.EncodeToString(decoded) != nonce {
-		return routingAttemptCorrelation{}, http.StatusBadRequest, errRoutingCanaryCorrelationMalformed
+	nonce, present, status, err := consumeRoutingCorrelationNonce(request)
+	if err != nil || !present {
+		return routingAttemptCorrelation{}, status, err
 	}
 	if apiKey == nil || apiKey.ID != routingCanaryAPIKeyID || apiKey.GroupID == nil || *apiKey.GroupID != routingCanaryGroupID {
 		return routingAttemptCorrelation{}, http.StatusForbidden, errRoutingCanaryCorrelationForbidden
 	}
+	return routingCorrelationFromNonce(apiKey.ID, nonce), 0, nil
+}
+
+// consumeRoutingGatewayCorrelation preserves the legacy emitter authorization
+// while allowing v3 observer scopes to own their Group/API-key/loop tuple.
+// Syntax is consumed once and the header is always removed before forwarding.
+func consumeRoutingGatewayCorrelation(request *http.Request, apiKey *service.APIKey, observer *RoutingObserver) (routingAttemptCorrelation, int, error) {
+	nonce, present, status, err := consumeRoutingCorrelationNonce(request)
+	if err != nil || !present {
+		return routingAttemptCorrelation{}, status, err
+	}
+	if apiKey == nil || apiKey.GroupID == nil {
+		return routingAttemptCorrelation{}, http.StatusForbidden, errRoutingCanaryCorrelationForbidden
+	}
+	correlation := routingCorrelationFromNonce(apiKey.ID, nonce)
+	legacyAllowed := apiKey.ID == routingCanaryAPIKeyID && *apiKey.GroupID == routingCanaryGroupID
+	observerAllowed := observer != nil && observer.CanAuthorizeCanary(*apiKey.GroupID, apiKey.ID, correlation.CorrelationSHA256)
+	if !legacyAllowed && !observerAllowed {
+		return routingAttemptCorrelation{}, http.StatusForbidden, errRoutingCanaryCorrelationForbidden
+	}
+	return correlation, 0, nil
+}
+
+func consumeRoutingCorrelationNonce(request *http.Request) (string, bool, int, error) {
+	if request == nil {
+		return "", false, 0, nil
+	}
+	values := request.Header.Values(routingCanaryCorrelationHeader)
+	request.Header.Del(routingCanaryCorrelationHeader)
+	if len(values) == 0 {
+		return "", false, 0, nil
+	}
+	if len(values) != 1 {
+		return "", false, http.StatusBadRequest, errRoutingCanaryCorrelationMalformed
+	}
+	nonce := values[0]
+	if len(nonce) != routingCanaryNonceEncodedLength {
+		return "", false, http.StatusBadRequest, errRoutingCanaryCorrelationMalformed
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(nonce)
+	if err != nil || len(decoded) != routingCanaryNonceDecodedLength || base64.RawURLEncoding.EncodeToString(decoded) != nonce {
+		return "", false, http.StatusBadRequest, errRoutingCanaryCorrelationMalformed
+	}
+	return nonce, true, 0, nil
+}
+
+func routingCorrelationFromNonce(apiKeyID int64, nonce string) routingAttemptCorrelation {
 	digest := sha256.Sum256([]byte(routingCanaryCorrelationDomain + nonce))
 	return routingAttemptCorrelation{
-		APIKeyID:          apiKey.ID,
+		APIKeyID:          apiKeyID,
 		CorrelationSHA256: hex.EncodeToString(digest[:]),
-	}, 0, nil
+	}
 }
 
 func validRoutingAttemptCorrelationForGroup(correlation routingAttemptCorrelation, groupID int64) bool {

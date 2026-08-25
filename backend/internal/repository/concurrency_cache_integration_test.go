@@ -32,6 +32,45 @@ func TestConcurrencyCacheSuite(t *testing.T) {
 	suite.Run(t, new(ConcurrencyCacheSuite))
 }
 
+// Top-level name intentionally matches the frozen verification filter. Suite
+// subtests are not selected by `-run FailoverHandoff` when their parent name
+// does not match, so this is the authoritative real-Redis acceptance entry.
+func TestFailoverHandoffAcquireRealRedisAtomicPairSnapshot(t *testing.T) {
+	cache := NewConcurrencyCache(integrationRedis, testSlotTTLMinutes, int(testSlotTTL.Seconds()))
+	handoff, ok := cache.(service.AccountSlotHandoffCache)
+	require.True(t, ok)
+	ctx := context.Background()
+
+	acquired, err := cache.AcquireAccountSlot(ctx, 9910101, 2, "primary-released")
+	require.NoError(t, err)
+	require.True(t, acquired)
+	require.NoError(t, cache.ReleaseAccountSlot(ctx, 9910101, "primary-released"))
+	result, err := handoff.AcquireAccountSlotWithHandoff(ctx, 9910101, 9910202, 2, "fallback-after-release")
+	require.NoError(t, err)
+	require.True(t, result.Acquired)
+	require.Positive(t, result.RedisUnix)
+	require.Zero(t, result.PredecessorConcurrency)
+	require.Equal(t, 1, result.FallbackConcurrency)
+
+	acquired, err = cache.AcquireAccountSlot(ctx, 9910303, 2, "primary-still-active")
+	require.NoError(t, err)
+	require.True(t, acquired)
+	result, err = handoff.AcquireAccountSlotWithHandoff(ctx, 9910303, 9910404, 2, "fallback-with-overlap")
+	require.NoError(t, err)
+	require.True(t, result.Acquired)
+	require.Equal(t, 1, result.PredecessorConcurrency)
+	require.Equal(t, 1, result.FallbackConcurrency)
+
+	acquired, err = cache.AcquireAccountSlot(ctx, 9910505, 1, "fallback-full")
+	require.NoError(t, err)
+	require.True(t, acquired)
+	result, err = handoff.AcquireAccountSlotWithHandoff(ctx, 9910303, 9910505, 1, "fallback-blocked")
+	require.NoError(t, err)
+	require.False(t, result.Acquired)
+	require.Equal(t, 1, result.PredecessorConcurrency)
+	require.Equal(t, 1, result.FallbackConcurrency)
+}
+
 func (s *ConcurrencyCacheSuite) SetupTest() {
 	s.IntegrationRedisSuite.SetupTest()
 	s.rawCache = NewConcurrencyCache(s.rdb, testSlotTTLMinutes, int(testSlotTTL.Seconds())).(*concurrencyCache)
@@ -158,6 +197,41 @@ func (s *ConcurrencyCacheSuite) TestAccountSlot_AcquireAndRelease() {
 	cur, err = s.cache.GetAccountConcurrency(s.ctx, accountID)
 	require.NoError(s.T(), err, "GetAccountConcurrency after release")
 	require.Equal(s.T(), 1, cur, "expected 1 after release")
+}
+
+func (s *ConcurrencyCacheSuite) TestFailoverHandoffAcquire_AtomicPairSnapshot() {
+	handoff, ok := s.cache.(service.AccountSlotHandoffCache)
+	require.True(s.T(), ok)
+
+	acquired, err := s.cache.AcquireAccountSlot(s.ctx, 10101, 2, "primary-released")
+	require.NoError(s.T(), err)
+	require.True(s.T(), acquired)
+	require.NoError(s.T(), s.cache.ReleaseAccountSlot(s.ctx, 10101, "primary-released"))
+
+	result, err := handoff.AcquireAccountSlotWithHandoff(s.ctx, 10101, 10202, 2, "fallback-after-release")
+	require.NoError(s.T(), err)
+	require.True(s.T(), result.Acquired)
+	require.Positive(s.T(), result.RedisUnix)
+	require.Zero(s.T(), result.PredecessorConcurrency)
+	require.Equal(s.T(), 1, result.FallbackConcurrency)
+
+	acquired, err = s.cache.AcquireAccountSlot(s.ctx, 10303, 2, "primary-still-active")
+	require.NoError(s.T(), err)
+	require.True(s.T(), acquired)
+	result, err = handoff.AcquireAccountSlotWithHandoff(s.ctx, 10303, 10404, 2, "fallback-with-overlap")
+	require.NoError(s.T(), err)
+	require.True(s.T(), result.Acquired)
+	require.Equal(s.T(), 1, result.PredecessorConcurrency)
+	require.Equal(s.T(), 1, result.FallbackConcurrency)
+
+	acquired, err = s.cache.AcquireAccountSlot(s.ctx, 10505, 1, "fallback-full")
+	require.NoError(s.T(), err)
+	require.True(s.T(), acquired)
+	result, err = handoff.AcquireAccountSlotWithHandoff(s.ctx, 10303, 10505, 1, "fallback-blocked")
+	require.NoError(s.T(), err)
+	require.False(s.T(), result.Acquired)
+	require.Equal(s.T(), 1, result.PredecessorConcurrency)
+	require.Equal(s.T(), 1, result.FallbackConcurrency)
 }
 
 func (s *ConcurrencyCacheSuite) TestAccountActiveIndex_AcquireAndRelease() {

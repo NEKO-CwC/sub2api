@@ -417,6 +417,22 @@ gateway:
     flush_interval_ms: 250
     request_timeout_ms: 1000
     shutdown_timeout_ms: 5000
+  # Source-local routing policy observer. Default off; do not enable together
+  # with routing_attempt_emitter. Scope/policy values are installed via Admin.
+  routing_observer:
+    enabled: false
+    panel_url: ""
+    secret: ""
+    sub2api_instance_id: 0
+    data_dir: "/app/data/routing-observer"
+    queue_size: 256
+    request_timeout_ms: 1000
+    shutdown_timeout_ms: 5000
+    max_scopes: 64
+    max_accounts_per_scope: 32
+    max_rules_per_policy: 16
+    max_attempts_per_request: 64
+    max_pending_outbox: 64
   # OpenAI 高级调度器补充配置
   openai_scheduler:
     # 是否允许 session_hash sticky 在账号健康度恶化时临时逃逸；false 可一键回退旧行为

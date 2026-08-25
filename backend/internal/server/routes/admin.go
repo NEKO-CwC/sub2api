@@ -200,6 +200,10 @@ func registerOpsRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 		ops.GET("/scheduler-membership/capability", h.Admin.Ops.GetSchedulerMembershipConfirmationCapability)
 		ops.POST("/scheduler-membership/confirm", h.Admin.Ops.ConfirmSchedulerMembership)
 		ops.GET("/routing-attempt-emitter/health", h.OpenAIGateway.GetRoutingAttemptEmitterHealth)
+		ops.GET("/routing-observer/health", h.OpenAIGateway.GetRoutingObserverHealth)
+		ops.GET("/routing-observer/scopes/:group_id/:canonical_model", h.OpenAIGateway.GetRoutingObserverScope)
+		ops.PUT("/routing-observer/scopes/:group_id/:canonical_model", h.OpenAIGateway.PutRoutingObserverScope)
+		ops.DELETE("/routing-observer/scopes/:group_id/:canonical_model", h.OpenAIGateway.DeleteRoutingObserverScope)
 
 		// Alerts (rules + events)
 		ops.GET("/alert-rules", h.Admin.Ops.ListAlertRules)

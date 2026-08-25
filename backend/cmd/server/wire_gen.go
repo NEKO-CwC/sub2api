@@ -443,6 +443,12 @@ func provideCleanup(
 		}
 
 		parallelSteps := []cleanupStep{
+			{"RoutingObserver", func() error {
+				if openAIGatewayHandler != nil {
+					openAIGatewayHandler.CloseRoutingObserver()
+				}
+				return nil
+			}},
 			{"RoutingAttemptEmitter", func() error {
 				if openAIGatewayHandler != nil {
 					openAIGatewayHandler.CloseRoutingAttemptEmitter()
