@@ -429,7 +429,8 @@ func TestRoutingObserverOutboxCapacityAndDiskFailureNeverCreateUndurableSend(t *
 		t.Cleanup(observer.Close)
 		_, err := observer.PutScope(31, "gpt-5.6-sol", routingObserverScopeRequest("scope-create", 0, "", true))
 		require.NoError(t, err)
-		store := observer.incidentStore.(*routingObserverFileStore)
+		store, ok := observer.incidentStore.(*routingObserverFileStore)
+		require.True(t, ok)
 		store.atomicWriteHook = func(stage string) error {
 			if stage == "before_create" {
 				return errors.New("injected outbox disk failure")
@@ -455,7 +456,8 @@ func TestRoutingObserverShutdownDeadlineIsHardAndRecoverable(t *testing.T) {
 	observer := newRoutingObserverWithDependencies(cfg, nil, transport)
 	_, err := observer.PutScope(31, "gpt-5.6-sol", routingObserverScopeRequest("scope-create", 0, "", true))
 	require.NoError(t, err)
-	store := observer.incidentStore.(*routingObserverFileStore)
+	store, ok := observer.incidentStore.(*routingObserverFileStore)
+	require.True(t, ok)
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var blocked atomic.Bool

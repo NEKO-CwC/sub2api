@@ -360,9 +360,15 @@ func syncRoutingObserverDirectory(directory string) error {
 	if err != nil {
 		return fmt.Errorf("open routing observer directory for sync: %w", err)
 	}
-	defer handle.Close()
 	if err := handle.Sync(); err != nil {
-		return fmt.Errorf("sync routing observer directory: %w", err)
+		syncErr := fmt.Errorf("sync routing observer directory: %w", err)
+		if closeErr := handle.Close(); closeErr != nil {
+			return errors.Join(syncErr, fmt.Errorf("close routing observer directory: %w", closeErr))
+		}
+		return syncErr
+	}
+	if err := handle.Close(); err != nil {
+		return fmt.Errorf("close routing observer directory: %w", err)
 	}
 	return nil
 }

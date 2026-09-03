@@ -324,17 +324,6 @@ func (o *RoutingObserver) markDegraded(reason string) {
 	o.mu.Unlock()
 }
 
-func (o *RoutingObserver) clearDegraded(reasons ...string) {
-	if o == nil {
-		return
-	}
-	o.mu.Lock()
-	for _, reason := range reasons {
-		delete(o.degradedReasons, reason)
-	}
-	o.mu.Unlock()
-}
-
 func (o *RoutingObserver) Health() RoutingObserverHealth {
 	if o == nil {
 		return RoutingObserverHealth{}
@@ -1590,11 +1579,17 @@ func (t *routingIncidentHTTPTransport) Deliver(ctx context.Context, item routing
 	if err != nil {
 		return RoutingIncidentAck{}, routingObserverReasonTransport, err
 	}
-	defer response.Body.Close()
 	limited := io.LimitReader(response.Body, routingIncidentMaxResponseBytes+1)
-	payload, err := io.ReadAll(limited)
-	if err != nil {
-		return RoutingIncidentAck{}, routingObserverReasonTransport, err
+	payload, readErr := io.ReadAll(limited)
+	closeErr := response.Body.Close()
+	if readErr != nil {
+		if closeErr != nil {
+			return RoutingIncidentAck{}, routingObserverReasonTransport, errors.Join(readErr, fmt.Errorf("close routing incident response: %w", closeErr))
+		}
+		return RoutingIncidentAck{}, routingObserverReasonTransport, readErr
+	}
+	if closeErr != nil {
+		return RoutingIncidentAck{}, routingObserverReasonTransport, fmt.Errorf("close routing incident response: %w", closeErr)
 	}
 	if len(payload) > routingIncidentMaxResponseBytes {
 		return RoutingIncidentAck{}, routingObserverReasonAckMismatch, errors.New("routing incident ACK exceeds the response bound")

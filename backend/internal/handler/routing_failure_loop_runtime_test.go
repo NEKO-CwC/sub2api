@@ -45,7 +45,11 @@ func TestRoutingFailureLoopSourceProcess(t *testing.T) {
 	defer observer.Close()
 
 	redisClient := redis.NewClient(&redis.Options{Addr: settings.redisAddress})
-	defer redisClient.Close()
+	t.Cleanup(func() {
+		if err := redisClient.Close(); err != nil {
+			t.Errorf("close routing failure loop Redis client: %v", err)
+		}
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if err := redisClient.Ping(ctx).Err(); err != nil {
