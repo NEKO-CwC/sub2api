@@ -50,6 +50,25 @@ type SchedulerBucket struct {
 	Mode     string
 }
 
+// SchedulerSnapshotInspection is a read-only view of one active scheduler
+// bucket. Unlike GetSnapshot, Ready remains true for a published empty
+// snapshot, which lets control-plane callers distinguish an empty bucket from
+// a cache miss.
+type SchedulerSnapshotInspection struct {
+	Bucket        SchedulerBucket
+	Ready         bool
+	ActiveVersion int64
+	AccountIDs    []int64
+}
+
+// SchedulerSnapshotInspector is intentionally separate from SchedulerCache so
+// existing cache implementations and test doubles do not acquire a new
+// mandatory method. Production confirmation requires this optional capability
+// and fails closed when it is absent.
+type SchedulerSnapshotInspector interface {
+	InspectSchedulerSnapshot(ctx context.Context, bucket SchedulerBucket) (SchedulerSnapshotInspection, error)
+}
+
 func (b SchedulerBucket) String() string {
 	return fmt.Sprintf("%d:%s:%s", b.GroupID, b.Platform, b.Mode)
 }

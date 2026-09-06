@@ -1766,6 +1766,10 @@ func TestOpenAIStreamingResponseFailedBeforeOutputReturnsFailover(t *testing.T) 
 	require.ErrorAs(t, err, &failoverErr)
 	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
 	require.False(t, failoverErr.RetryableOnSameAccount)
+	require.Equal(t, GatewayFailureStageInference, failoverErr.Stage)
+	require.Equal(t, GatewayFailureScopeAccount, failoverErr.Scope)
+	require.Equal(t, openAIStreamFailureReason, failoverErr.Reason)
+	require.Equal(t, NextAccountRetry, failoverErr.NextAccountAction)
 	require.Contains(t, string(failoverErr.ResponseBody), "An error occurred while processing your request")
 	require.False(t, c.Writer.Written())
 	require.Empty(t, rec.Body.String())
@@ -1860,6 +1864,7 @@ func TestOpenAIStreamingResponseFailedBeforeOutputServerOverloadedCodeReturnsFai
 	// 否则单个被降载的请求会把整池账号逐个消耗掉，而降载因素在每个账号上都相同。
 	require.True(t, failoverErr.RetryableOnSameAccount)
 	require.True(t, failoverErr.RequestScopedTransient)
+	require.Equal(t, openAIRequestScopedFailureReason, failoverErr.Reason)
 	require.False(t, c.Writer.Written())
 	require.Empty(t, rec.Body.String())
 }

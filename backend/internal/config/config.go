@@ -10,6 +10,8 @@ import (
 	"net/textproto"
 	"net/url"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -1083,6 +1085,13 @@ type GatewayConfig struct {
 
 	// UsageRecord: 使用量记录异步队列配置（有界队列 + 固定 worker）
 	UsageRecord GatewayUsageRecordConfig `mapstructure:"usage_record"`
+	// RoutingAttemptEmitter is optional, additive evidence for the Panel.
+	// It is disabled by default and failures never affect request forwarding.
+	RoutingAttemptEmitter GatewayRoutingAttemptEmitterConfig `mapstructure:"routing_attempt_emitter"`
+	// RoutingObserver evaluates bounded, typed routing facts at the source and
+	// sends only durable incident state changes. It is mutually exclusive with
+	// the legacy per-attempt emitter and remains disabled by default.
+	RoutingObserver GatewayRoutingObserverConfig `mapstructure:"routing_observer"`
 
 	// UserGroupRateCacheTTLSeconds: 用户分组倍率热路径缓存 TTL（秒）
 	UserGroupRateCacheTTLSeconds int `mapstructure:"user_group_rate_cache_ttl_seconds"`
@@ -1100,6 +1109,53 @@ type GatewayConfig struct {
 	// 仅作用于 payg（按量付费）账号：周期探测余额，低于阈值则临时停调。
 	CNProviders GatewayCNProvidersConfig `mapstructure:"cn_providers"`
 }
+
+// GatewayRoutingAttemptEmitterConfig reports gateway facts while routing
+// policy remains owned by the Panel.
+type GatewayRoutingAttemptEmitterConfig struct {
+	Enabled           bool    `mapstructure:"enabled"`
+	PanelURL          string  `mapstructure:"panel_url"`
+	Secret            string  `mapstructure:"secret"`
+	Sub2APIInstanceID int64   `mapstructure:"sub2api_instance_id"`
+	AllowedGroupIDs   []int64 `mapstructure:"allowed_group_ids"`
+	QueueSize         int     `mapstructure:"queue_size"`
+	BatchSize         int     `mapstructure:"batch_size"`
+	FlushIntervalMS   int     `mapstructure:"flush_interval_ms"`
+	RequestTimeoutMS  int     `mapstructure:"request_timeout_ms"`
+	ShutdownTimeoutMS int     `mapstructure:"shutdown_timeout_ms"`
+}
+
+type GatewayRoutingObserverConfig struct {
+	Enabled               bool   `mapstructure:"enabled"`
+	PanelURL              string `mapstructure:"panel_url"`
+	Secret                string `mapstructure:"secret"`
+	Sub2APIInstanceID     int64  `mapstructure:"sub2api_instance_id"`
+	DataDir               string `mapstructure:"data_dir"`
+	QueueSize             int    `mapstructure:"queue_size"`
+	RequestTimeoutMS      int    `mapstructure:"request_timeout_ms"`
+	ShutdownTimeoutMS     int    `mapstructure:"shutdown_timeout_ms"`
+	MaxScopes             int    `mapstructure:"max_scopes"`
+	MaxAccountsPerScope   int    `mapstructure:"max_accounts_per_scope"`
+	MaxRulesPerPolicy     int    `mapstructure:"max_rules_per_policy"`
+	MaxAttemptsPerRequest int    `mapstructure:"max_attempts_per_request"`
+	MaxPendingOutbox      int    `mapstructure:"max_pending_outbox"`
+}
+
+const (
+	GatewayRoutingAttemptEmitterMaxQueueSize         = 16_384
+	GatewayRoutingAttemptEmitterMaxBatchSize         = 256
+	GatewayRoutingAttemptEmitterMaxFlushIntervalMS   = 60_000
+	GatewayRoutingAttemptEmitterMaxRequestTimeoutMS  = 10_000
+	GatewayRoutingAttemptEmitterMaxShutdownTimeoutMS = 30_000
+	GatewayRoutingObserverMaxQueueSize               = 16_384
+	GatewayRoutingObserverMaxRequestTimeoutMS        = 10_000
+	GatewayRoutingObserverMaxShutdownTimeoutMS       = 30_000
+	GatewayRoutingObserverMaxScopes                  = 64
+	GatewayRoutingObserverMaxAccountsPerScope        = 32
+	GatewayRoutingObserverMaxRulesPerPolicy          = 16
+	GatewayRoutingObserverMaxAttemptsPerRequest      = 64
+	GatewayRoutingObserverMaxPendingOutbox           = 64
+)
 
 // GatewayGrokConfig holds Grok-specific gateway scheduling knobs.
 //
@@ -1448,6 +1504,11 @@ type TLSProfileConfig struct {
 
 // GatewaySchedulingConfig accounts scheduling configuration.
 type GatewaySchedulingConfig struct {
+	// GroupScopedPriorityEnabled allows OpenAI requests scoped to one Group to
+	// rank accounts by account_groups.priority. It is disabled by default so
+	// existing deployments retain the global accounts.priority behavior.
+	GroupScopedPriorityEnabled bool `mapstructure:"group_scoped_priority_enabled"`
+
 	// 粘性会话排队配置
 	StickySessionMaxWaiting  int           `mapstructure:"sticky_session_max_waiting"`
 	StickySessionWaitTimeout time.Duration `mapstructure:"sticky_session_wait_timeout"`
@@ -1769,6 +1830,40 @@ func NormalizeRunMode(value string) string {
 	}
 }
 
+func parseRoutingAttemptAllowedGroupIDs(value string) ([]int64, error) {
+	parts := strings.Split(value, ",")
+	groupIDs := make([]int64, 0, len(parts))
+	for _, part := range parts {
+		normalized := strings.TrimSpace(part)
+		if normalized == "" {
+			return nil, fmt.Errorf("gateway.routing_attempt_emitter.allowed_group_ids must be a comma-separated list of positive integers")
+		}
+		groupID, err := strconv.ParseInt(normalized, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("gateway.routing_attempt_emitter.allowed_group_ids must be a comma-separated list of positive integers")
+		}
+		groupIDs = append(groupIDs, groupID)
+	}
+	return normalizeRoutingAttemptAllowedGroupIDs(groupIDs)
+}
+
+func normalizeRoutingAttemptAllowedGroupIDs(value []int64) ([]int64, error) {
+	if len(value) == 0 {
+		return nil, fmt.Errorf("gateway.routing_attempt_emitter.allowed_group_ids must contain at least one Group when enabled")
+	}
+	result := append([]int64(nil), value...)
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	for index, groupID := range result {
+		if groupID <= 0 {
+			return nil, fmt.Errorf("gateway.routing_attempt_emitter.allowed_group_ids must contain only positive Group IDs")
+		}
+		if index > 0 && result[index-1] == groupID {
+			return nil, fmt.Errorf("gateway.routing_attempt_emitter.allowed_group_ids must not contain duplicate Group IDs")
+		}
+	}
+	return result, nil
+}
+
 // Load 读取并校验完整配置（要求 jwt.secret 已显式提供）。
 func Load() (*Config, error) {
 	return load(false)
@@ -1808,6 +1903,18 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 	}
 	trustedProxiesEnv, trustedProxiesEnvConfigured := os.LookupEnv("SERVER_TRUSTED_PROXIES")
 	forwardedClientIPHeadersEnv, forwardedClientIPHeadersEnvConfigured := os.LookupEnv("SECURITY_FORWARDED_CLIENT_IP_HEADERS")
+	routingAttemptAllowedGroupsEnv, routingAttemptAllowedGroupsEnvConfigured := os.LookupEnv("GATEWAY_ROUTING_ATTEMPT_EMITTER_ALLOWED_GROUP_IDS")
+	if routingAttemptAllowedGroupsEnvConfigured {
+		allowedGroupIDs := []int64{}
+		if strings.TrimSpace(routingAttemptAllowedGroupsEnv) != "" {
+			var err error
+			allowedGroupIDs, err = parseRoutingAttemptAllowedGroupIDs(routingAttemptAllowedGroupsEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+		viper.Set("gateway.routing_attempt_emitter.allowed_group_ids", allowedGroupIDs)
+	}
 	trustedProxiesConfigured := viper.InConfig("server.trusted_proxies") ||
 		viper.IsSet("server.trusted_proxies") || trustedProxiesEnvConfigured
 
@@ -2484,6 +2591,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.image_nonstream_keepalive_interval", 0)
 	viper.SetDefault("gateway.max_line_size", 500*1024*1024)
 	viper.SetDefault("gateway.scheduling.sticky_session_max_waiting", 3)
+	viper.SetDefault("gateway.scheduling.group_scoped_priority_enabled", false)
 	viper.SetDefault("gateway.scheduling.sticky_session_wait_timeout", 120*time.Second)
 	viper.SetDefault("gateway.scheduling.fallback_wait_timeout", 30*time.Second)
 	viper.SetDefault("gateway.scheduling.fallback_max_waiting", 100)
@@ -2520,6 +2628,29 @@ func setDefaults() {
 	viper.SetDefault("gateway.usage_record.auto_scale_down_step", 16)
 	viper.SetDefault("gateway.usage_record.auto_scale_check_interval_seconds", 3)
 	viper.SetDefault("gateway.usage_record.auto_scale_cooldown_seconds", 10)
+	viper.SetDefault("gateway.routing_attempt_emitter.enabled", false)
+	viper.SetDefault("gateway.routing_attempt_emitter.panel_url", "")
+	viper.SetDefault("gateway.routing_attempt_emitter.secret", "")
+	viper.SetDefault("gateway.routing_attempt_emitter.sub2api_instance_id", 0)
+	viper.SetDefault("gateway.routing_attempt_emitter.allowed_group_ids", []int64{})
+	viper.SetDefault("gateway.routing_attempt_emitter.queue_size", 256)
+	viper.SetDefault("gateway.routing_attempt_emitter.batch_size", 32)
+	viper.SetDefault("gateway.routing_attempt_emitter.flush_interval_ms", 250)
+	viper.SetDefault("gateway.routing_attempt_emitter.request_timeout_ms", 1000)
+	viper.SetDefault("gateway.routing_attempt_emitter.shutdown_timeout_ms", 5000)
+	viper.SetDefault("gateway.routing_observer.enabled", false)
+	viper.SetDefault("gateway.routing_observer.panel_url", "")
+	viper.SetDefault("gateway.routing_observer.secret", "")
+	viper.SetDefault("gateway.routing_observer.sub2api_instance_id", 0)
+	viper.SetDefault("gateway.routing_observer.data_dir", "")
+	viper.SetDefault("gateway.routing_observer.queue_size", 256)
+	viper.SetDefault("gateway.routing_observer.request_timeout_ms", 1000)
+	viper.SetDefault("gateway.routing_observer.shutdown_timeout_ms", 5000)
+	viper.SetDefault("gateway.routing_observer.max_scopes", 64)
+	viper.SetDefault("gateway.routing_observer.max_accounts_per_scope", 32)
+	viper.SetDefault("gateway.routing_observer.max_rules_per_policy", 16)
+	viper.SetDefault("gateway.routing_observer.max_attempts_per_request", 64)
+	viper.SetDefault("gateway.routing_observer.max_pending_outbox", 64)
 	viper.SetDefault("gateway.user_group_rate_cache_ttl_seconds", 30)
 	viper.SetDefault("gateway.models_list_cache_ttl_seconds", 15)
 	// TLS指纹伪装配置（默认关闭，需要账号级别单独启用）
@@ -3552,6 +3683,65 @@ func (c *Config) Validate() error {
 	}
 	if c.Gateway.UsageRecord.WorkerCount <= 0 {
 		return fmt.Errorf("gateway.usage_record.worker_count must be positive")
+	}
+	if c.Gateway.RoutingAttemptEmitter.QueueSize <= 0 || c.Gateway.RoutingAttemptEmitter.QueueSize > GatewayRoutingAttemptEmitterMaxQueueSize {
+		return fmt.Errorf("gateway.routing_attempt_emitter.queue_size must be between 1 and %d", GatewayRoutingAttemptEmitterMaxQueueSize)
+	}
+	if c.Gateway.RoutingAttemptEmitter.BatchSize <= 0 || c.Gateway.RoutingAttemptEmitter.BatchSize > c.Gateway.RoutingAttemptEmitter.QueueSize || c.Gateway.RoutingAttemptEmitter.BatchSize > GatewayRoutingAttemptEmitterMaxBatchSize {
+		return fmt.Errorf("gateway.routing_attempt_emitter.batch_size must be between 1 and min(queue_size, %d)", GatewayRoutingAttemptEmitterMaxBatchSize)
+	}
+	if c.Gateway.RoutingAttemptEmitter.FlushIntervalMS <= 0 || c.Gateway.RoutingAttemptEmitter.FlushIntervalMS > GatewayRoutingAttemptEmitterMaxFlushIntervalMS {
+		return fmt.Errorf("gateway.routing_attempt_emitter.flush_interval_ms must be between 1 and %d", GatewayRoutingAttemptEmitterMaxFlushIntervalMS)
+	}
+	if c.Gateway.RoutingAttemptEmitter.RequestTimeoutMS <= 0 || c.Gateway.RoutingAttemptEmitter.RequestTimeoutMS > GatewayRoutingAttemptEmitterMaxRequestTimeoutMS {
+		return fmt.Errorf("gateway.routing_attempt_emitter.request_timeout_ms must be between 1 and %d", GatewayRoutingAttemptEmitterMaxRequestTimeoutMS)
+	}
+	if c.Gateway.RoutingAttemptEmitter.ShutdownTimeoutMS <= 0 || c.Gateway.RoutingAttemptEmitter.ShutdownTimeoutMS > GatewayRoutingAttemptEmitterMaxShutdownTimeoutMS {
+		return fmt.Errorf("gateway.routing_attempt_emitter.shutdown_timeout_ms must be between 1 and %d", GatewayRoutingAttemptEmitterMaxShutdownTimeoutMS)
+	}
+	if c.Gateway.RoutingAttemptEmitter.Enabled {
+		if strings.TrimSpace(c.Gateway.RoutingAttemptEmitter.PanelURL) == "" || strings.TrimSpace(c.Gateway.RoutingAttemptEmitter.Secret) == "" || c.Gateway.RoutingAttemptEmitter.Sub2APIInstanceID <= 0 {
+			return fmt.Errorf("gateway.routing_attempt_emitter requires panel_url, secret, and positive sub2api_instance_id when enabled")
+		}
+		if _, err := normalizeRoutingAttemptAllowedGroupIDs(c.Gateway.RoutingAttemptEmitter.AllowedGroupIDs); err != nil {
+			return err
+		}
+	}
+	observer := c.Gateway.RoutingObserver
+	if observer.QueueSize <= 0 || observer.QueueSize > GatewayRoutingObserverMaxQueueSize {
+		return fmt.Errorf("gateway.routing_observer.queue_size must be between 1 and %d", GatewayRoutingObserverMaxQueueSize)
+	}
+	if observer.RequestTimeoutMS <= 0 || observer.RequestTimeoutMS > GatewayRoutingObserverMaxRequestTimeoutMS {
+		return fmt.Errorf("gateway.routing_observer.request_timeout_ms must be between 1 and %d", GatewayRoutingObserverMaxRequestTimeoutMS)
+	}
+	if observer.ShutdownTimeoutMS <= 0 || observer.ShutdownTimeoutMS > GatewayRoutingObserverMaxShutdownTimeoutMS {
+		return fmt.Errorf("gateway.routing_observer.shutdown_timeout_ms must be between 1 and %d", GatewayRoutingObserverMaxShutdownTimeoutMS)
+	}
+	if observer.MaxScopes <= 0 || observer.MaxScopes > GatewayRoutingObserverMaxScopes {
+		return fmt.Errorf("gateway.routing_observer.max_scopes must be between 1 and %d", GatewayRoutingObserverMaxScopes)
+	}
+	if observer.MaxAccountsPerScope <= 0 || observer.MaxAccountsPerScope > GatewayRoutingObserverMaxAccountsPerScope {
+		return fmt.Errorf("gateway.routing_observer.max_accounts_per_scope must be between 1 and %d", GatewayRoutingObserverMaxAccountsPerScope)
+	}
+	if observer.MaxRulesPerPolicy <= 0 || observer.MaxRulesPerPolicy > GatewayRoutingObserverMaxRulesPerPolicy {
+		return fmt.Errorf("gateway.routing_observer.max_rules_per_policy must be between 1 and %d", GatewayRoutingObserverMaxRulesPerPolicy)
+	}
+	if observer.MaxAttemptsPerRequest <= 0 || observer.MaxAttemptsPerRequest > GatewayRoutingObserverMaxAttemptsPerRequest {
+		return fmt.Errorf("gateway.routing_observer.max_attempts_per_request must be between 1 and %d", GatewayRoutingObserverMaxAttemptsPerRequest)
+	}
+	if observer.MaxPendingOutbox <= 0 || observer.MaxPendingOutbox > GatewayRoutingObserverMaxPendingOutbox {
+		return fmt.Errorf("gateway.routing_observer.max_pending_outbox must be between 1 and %d", GatewayRoutingObserverMaxPendingOutbox)
+	}
+	if observer.Enabled {
+		if c.Gateway.RoutingAttemptEmitter.Enabled {
+			return fmt.Errorf("gateway.routing_observer and gateway.routing_attempt_emitter cannot both be enabled")
+		}
+		if strings.TrimSpace(observer.PanelURL) == "" || strings.TrimSpace(observer.Secret) == "" || observer.Sub2APIInstanceID <= 0 || strings.TrimSpace(observer.DataDir) == "" {
+			return fmt.Errorf("gateway.routing_observer requires panel_url, secret, positive sub2api_instance_id, and data_dir when enabled")
+		}
+		if len(observer.Secret) < 16 {
+			return fmt.Errorf("gateway.routing_observer.secret must contain at least 16 bytes")
+		}
 	}
 	if c.Gateway.UsageRecord.QueueSize <= 0 {
 		return fmt.Errorf("gateway.usage_record.queue_size must be positive")

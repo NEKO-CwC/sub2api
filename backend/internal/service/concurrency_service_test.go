@@ -600,6 +600,21 @@ func TestGetAccountConcurrencyBatch(t *testing.T) {
 	}
 }
 
+func TestConfirmAccountConcurrencyBatchFailsClosed(t *testing.T) {
+	svc := NewConcurrencyService(&stubConcurrencyCacheForTest{concurrency: 3})
+	result, err := svc.ConfirmAccountConcurrencyBatch(context.Background(), []int64{1, 2})
+	require.NoError(t, err)
+	require.Equal(t, map[int64]int{1: 3, 2: 3}, result)
+
+	nilCache := NewConcurrencyService(nil)
+	_, err = nilCache.ConfirmAccountConcurrencyBatch(context.Background(), []int64{1})
+	require.Error(t, err)
+
+	failedCache := NewConcurrencyService(&stubConcurrencyCacheForTest{concurrencyErr: errors.New("redis unavailable")})
+	_, err = failedCache.ConfirmAccountConcurrencyBatch(context.Background(), []int64{1})
+	require.Error(t, err)
+}
+
 func TestIncrementAccountWaitCount_FailOpen(t *testing.T) {
 	cache := &stubConcurrencyCacheForTest{waitErr: errors.New("redis error")}
 	svc := NewConcurrencyService(cache)

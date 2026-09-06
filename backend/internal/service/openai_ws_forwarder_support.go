@@ -715,7 +715,7 @@ func openAIWSSemantic429Headers(account *Account, model string, headers http.Hea
 }
 
 func (s *OpenAIGatewayService) newOpenAIWSRateLimitFailoverError(account *Account, headers http.Header, responseBody []byte, message string) *UpstreamFailoverError {
-	return s.newOpenAIAccountFailoverError(
+	failoverErr := s.newOpenAIAccountFailoverError(
 		account,
 		http.StatusTooManyRequests,
 		headers,
@@ -724,6 +724,10 @@ func (s *OpenAIGatewayService) newOpenAIWSRateLimitFailoverError(account *Accoun
 		false,
 		false,
 	)
+	if failoverErr.Reason == openAIUpstreamResponseFailureReason {
+		failoverErr.Reason = openAIWSRateLimitFailureReason
+	}
+	return failoverErr
 }
 
 func classifyOpenAIWSErrorEventFromRaw(codeRaw, errTypeRaw, msgRaw string) (string, bool) {

@@ -406,6 +406,33 @@ gateway:
       quota_headroom: 0.0
       # 倾向上游声明倍率更低的账号；0 表示关闭（默认），建议启用时从 1.5 开始。
       upstream_cost: 0.0
+  # Optional, best-effort routing attempt evidence for Codex Panel. Default off.
+  routing_attempt_emitter:
+    enabled: false
+    panel_url: ""
+    secret: ""
+    sub2api_instance_id: 0
+    queue_size: 256
+    batch_size: 32
+    flush_interval_ms: 250
+    request_timeout_ms: 1000
+    shutdown_timeout_ms: 5000
+  # Source-local routing policy observer. Default off; do not enable together
+  # with routing_attempt_emitter. Scope/policy values are installed via Admin.
+  routing_observer:
+    enabled: false
+    panel_url: ""
+    secret: ""
+    sub2api_instance_id: 0
+    data_dir: "/app/data/routing-observer"
+    queue_size: 256
+    request_timeout_ms: 1000
+    shutdown_timeout_ms: 5000
+    max_scopes: 64
+    max_accounts_per_scope: 32
+    max_rules_per_policy: 16
+    max_attempts_per_request: 64
+    max_pending_outbox: 64
   # OpenAI 高级调度器补充配置
   openai_scheduler:
     # 是否允许 session_hash sticky 在账号健康度恶化时临时逃逸；false 可一键回退旧行为
@@ -521,6 +548,9 @@ gateway:
   # Scheduling configuration
   # 调度配置
   scheduling:
+    # Use account_groups.priority for Group-scoped OpenAI scheduling. Default
+    # false preserves the historical global accounts.priority behavior.
+    group_scoped_priority_enabled: false
     # Sticky session max waiting queue size
     # 粘性会话最大排队长度
     sticky_session_max_waiting: 3

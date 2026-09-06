@@ -14,7 +14,8 @@ import (
 )
 
 type OpsHandler struct {
-	opsService *service.OpsService
+	opsService        *service.OpsService
+	schedulerSnapshot *service.SchedulerSnapshotService
 }
 
 // GetErrorLogByID returns ops error log detail.
@@ -70,6 +71,14 @@ func parseOpsViewParam(c *gin.Context) string {
 
 func NewOpsHandler(opsService *service.OpsService) *OpsHandler {
 	return &OpsHandler{opsService: opsService}
+}
+
+// ProvideOpsHandler adds runtime scheduler inspection while preserving the
+// small NewOpsHandler constructor used by focused ops tests.
+func ProvideOpsHandler(opsService *service.OpsService, schedulerSnapshot *service.SchedulerSnapshotService) *OpsHandler {
+	handler := NewOpsHandler(opsService)
+	handler.schedulerSnapshot = schedulerSnapshot
+	return handler
 }
 
 // GetErrorLogs lists ops error logs.

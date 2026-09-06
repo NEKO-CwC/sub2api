@@ -320,7 +320,7 @@ type Account struct {
 	Proxy         *Proxy         `json:"proxy,omitempty"`
 	AccountGroups []AccountGroup `json:"account_groups,omitempty"`
 
-	GroupIDs []int64  `json:"group_ids,omitempty"`
+	GroupIDs []int64  `json:"group_ids"`
 	Groups   []*Group `json:"groups,omitempty"`
 }
 

@@ -141,10 +141,10 @@ func (s *OpenAIGatewayService) handleOpenAIUpstreamTransportError(ctx context.Co
 		s.tempUnscheduleOpenAITransportError(ctx, account, safeErr)
 	}
 
-	return &UpstreamFailoverError{
+	return typedOpenAIFailover(&UpstreamFailoverError{
 		StatusCode:   http.StatusBadGateway,
 		ResponseBody: openAITransportFailoverBody,
-	}
+	}, GatewayFailureScopeAccount, openAIUpstreamTransportFailureReason)
 }
 
 // tempUnscheduleOpenAITransportError marks an account temporarily unschedulable

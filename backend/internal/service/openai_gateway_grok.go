@@ -189,7 +189,7 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 		}
 		if s.shouldFailoverGrokUpstreamError(resp.StatusCode, respBody) {
 			retryable, retryDelay, retryDeadline, retryMax := grokSameAccountRetryMetadata(account, resp.StatusCode, respBody)
-			return nil, &UpstreamFailoverError{
+			return nil, typedOpenAIFailover(&UpstreamFailoverError{
 				StatusCode:               resp.StatusCode,
 				ResponseBody:             respBody,
 				ResponseHeaders:          resp.Header.Clone(),
@@ -198,7 +198,7 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 				SameAccountRetryDelay:    retryDelay,
 				SameAccountRetryDeadline: retryDeadline,
 				SameAccountRetryMax:      retryMax,
-			}
+			}, GatewayFailureScopeAccount, grokUpstreamResponseFailureReason)
 		}
 		return s.handleErrorResponse(ctx, resp, c, account, patchedBody, upstreamModel)
 	}
@@ -1428,7 +1428,7 @@ func (s *OpenAIGatewayService) describeGrokComposerImage(
 		s.handleGrokAccountUpstreamError(withGrokTeamRateLimitModel(ctx, grokComposerImageBridgeVisionModel), account, resp.StatusCode, resp.Header, respBody)
 		if s.shouldFailoverGrokUpstreamError(resp.StatusCode, respBody) {
 			retryable, retryDelay, retryDeadline, retryMax := grokSameAccountRetryMetadata(account, resp.StatusCode, respBody)
-			return "", OpenAIUsage{}, &UpstreamFailoverError{
+			return "", OpenAIUsage{}, typedOpenAIFailover(&UpstreamFailoverError{
 				StatusCode:               resp.StatusCode,
 				ResponseBody:             respBody,
 				ResponseHeaders:          resp.Header.Clone(),
@@ -1437,7 +1437,7 @@ func (s *OpenAIGatewayService) describeGrokComposerImage(
 				SameAccountRetryDelay:    retryDelay,
 				SameAccountRetryDeadline: retryDeadline,
 				SameAccountRetryMax:      retryMax,
-			}
+			}, GatewayFailureScopeAccount, grokUpstreamResponseFailureReason)
 		}
 		return "", OpenAIUsage{}, fmt.Errorf("grok composer image bridge upstream error: %s", upstreamMsg)
 	}

@@ -36,6 +36,9 @@ linters:
           list-mode: original
           files:
             - "**/internal/handler/**"
+            # This isolated test-only process deliberately wires the real Redis
+            # concurrency cache across layers; production handler code stays denied.
+            - "!**/internal/handler/routing_failure_loop_runtime_test.go"
           deny:
             - pkg: github.com/Wei-Shaw/sub2api/internal/repository
               desc: "handler must not import repository"

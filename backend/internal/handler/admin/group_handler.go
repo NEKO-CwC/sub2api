@@ -26,6 +26,11 @@ type GroupHandler struct {
 	groupCapacityService *service.GroupCapacityService
 }
 
+type groupAccountPriorityAdminService interface {
+	GetGroupAccountPriorities(ctx context.Context, groupID int64) (*service.GroupAccountPrioritySnapshot, error)
+	SetGroupAccountPriorities(ctx context.Context, groupID int64, input service.GroupAccountPriorityUpdate) (*service.GroupAccountPrioritySnapshot, error)
+}
+
 // GetLiveCapability 返回当前服务端是否具备生成 Live attestation 的运行环境。
 func (h *GroupHandler) GetLiveCapability(c *gin.Context) {
 	err := liveattestation.NewProvider().Check(c.Request.Context())
@@ -822,6 +827,59 @@ func (h *GroupHandler) GetGroupRateMultipliers(c *gin.Context) {
 		entries = []service.UserGroupRateEntry{}
 	}
 	response.Success(c, entries)
+}
+
+func (h *GroupHandler) GetGroupAccountPriorities(c *gin.Context) {
+	groupID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || groupID <= 0 {
+		response.BadRequest(c, "Invalid group ID")
+		return
+	}
+	priorityService, ok := h.adminService.(groupAccountPriorityAdminService)
+	if !ok {
+		response.ErrorFrom(c, service.ErrGroupAccountPriorityUnsupported)
+		return
+	}
+	snapshot, err := priorityService.GetGroupAccountPriorities(c.Request.Context(), groupID)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, snapshot)
+}
+
+type SetGroupAccountPrioritiesRequest struct {
+	OperationID          string                             `json:"operation_id" binding:"required"`
+	ExpectedReadbackHash string                             `json:"expected_readback_hash" binding:"required"`
+	Items                []service.GroupAccountPriorityItem `json:"items" binding:"required,min=1"`
+}
+
+func (h *GroupHandler) SetGroupAccountPriorities(c *gin.Context) {
+	groupID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || groupID <= 0 {
+		response.BadRequest(c, "Invalid group ID")
+		return
+	}
+	var request SetGroupAccountPrioritiesRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+	priorityService, ok := h.adminService.(groupAccountPriorityAdminService)
+	if !ok {
+		response.ErrorFrom(c, service.ErrGroupAccountPriorityUnsupported)
+		return
+	}
+	snapshot, err := priorityService.SetGroupAccountPriorities(c.Request.Context(), groupID, service.GroupAccountPriorityUpdate{
+		OperationID:          request.OperationID,
+		ExpectedReadbackHash: request.ExpectedReadbackHash,
+		Items:                request.Items,
+	})
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, snapshot)
 }
 
 // ClearGroupRateMultipliers handles clearing all rate multipliers for a group

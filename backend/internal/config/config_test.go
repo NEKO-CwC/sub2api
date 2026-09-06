@@ -103,6 +103,163 @@ func TestLoadHTTPIngressSafetyDefaults(t *testing.T) {
 	require.Equal(t, 16384, cfg.APIKeyAuth.InvalidAbuse.Capacity)
 }
 
+func TestLoadRoutingAttemptEmitterEnvironmentAndDefaults(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_ENABLED", "true")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_PANEL_URL", "https://panel.example.test")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_SECRET", "test-secret")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_SUB2API_INSTANCE_ID", "7")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_ALLOWED_GROUP_IDS", "5, 4")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_QUEUE_SIZE", "512")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_BATCH_SIZE", "64")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_FLUSH_INTERVAL_MS", "500")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_REQUEST_TIMEOUT_MS", "1500")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_SHUTDOWN_TIMEOUT_MS", "6000")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.Equal(t, GatewayRoutingAttemptEmitterConfig{
+		Enabled: true, PanelURL: "https://panel.example.test", Secret: "test-secret",
+		Sub2APIInstanceID: 7, AllowedGroupIDs: []int64{4, 5}, QueueSize: 512, BatchSize: 64, FlushIntervalMS: 500,
+		RequestTimeoutMS: 1500, ShutdownTimeoutMS: 6000,
+	}, cfg.Gateway.RoutingAttemptEmitter)
+}
+
+func TestRoutingAttemptEmitterAllowedGroupIDsFailClosedWhenEnabled(t *testing.T) {
+	for _, raw := range []string{"", "0", "4,4", "4,invalid"} {
+		t.Run(raw, func(t *testing.T) {
+			resetViperWithJWTSecret(t)
+			t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_ENABLED", "true")
+			t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_PANEL_URL", "https://panel.example.test")
+			t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_SECRET", "test-secret")
+			t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_SUB2API_INSTANCE_ID", "7")
+			t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_ALLOWED_GROUP_IDS", raw)
+
+			_, err := Load()
+			require.ErrorContains(t, err, "allowed_group_ids")
+		})
+	}
+}
+
+func TestRoutingAttemptEmitterEmptyAllowedGroupsRemainValidWhenDisabled(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_ALLOWED_GROUP_IDS", "")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.False(t, cfg.Gateway.RoutingAttemptEmitter.Enabled)
+	require.Empty(t, cfg.Gateway.RoutingAttemptEmitter.AllowedGroupIDs)
+}
+
+func TestValidateRoutingAttemptEmitterBounds(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*GatewayRoutingAttemptEmitterConfig)
+		want      string
+	}{
+		{"queue", func(c *GatewayRoutingAttemptEmitterConfig) {
+			c.QueueSize = GatewayRoutingAttemptEmitterMaxQueueSize + 1
+		}, "queue_size"},
+		{"batch", func(c *GatewayRoutingAttemptEmitterConfig) {
+			c.BatchSize = GatewayRoutingAttemptEmitterMaxBatchSize + 1
+		}, "batch_size"},
+		{"flush", func(c *GatewayRoutingAttemptEmitterConfig) {
+			c.FlushIntervalMS = GatewayRoutingAttemptEmitterMaxFlushIntervalMS + 1
+		}, "flush_interval_ms"},
+		{"request timeout", func(c *GatewayRoutingAttemptEmitterConfig) {
+			c.RequestTimeoutMS = GatewayRoutingAttemptEmitterMaxRequestTimeoutMS + 1
+		}, "request_timeout_ms"},
+		{"shutdown timeout", func(c *GatewayRoutingAttemptEmitterConfig) {
+			c.ShutdownTimeoutMS = GatewayRoutingAttemptEmitterMaxShutdownTimeoutMS + 1
+		}, "shutdown_timeout_ms"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resetViperWithJWTSecret(t)
+			cfg, err := Load()
+			require.NoError(t, err)
+			test.configure(&cfg.Gateway.RoutingAttemptEmitter)
+			require.ErrorContains(t, cfg.Validate(), test.want)
+		})
+	}
+}
+
+func TestLoadRoutingObserverEnvironmentAndDefaults(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_ENABLED", "true")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_PANEL_URL", "https://panel.example.test")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_SECRET", "test-secret-0123456789")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_SUB2API_INSTANCE_ID", "7")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_DATA_DIR", "/tmp/routing-observer-test")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.Equal(t, GatewayRoutingObserverConfig{
+		Enabled: true, PanelURL: "https://panel.example.test", Secret: "test-secret-0123456789",
+		Sub2APIInstanceID: 7, DataDir: "/tmp/routing-observer-test", QueueSize: 256,
+		RequestTimeoutMS: 1000, ShutdownTimeoutMS: 5000, MaxScopes: 64,
+		MaxAccountsPerScope: 32, MaxRulesPerPolicy: 16, MaxAttemptsPerRequest: 64,
+		MaxPendingOutbox: 64,
+	}, cfg.Gateway.RoutingObserver)
+}
+
+func TestRoutingObserverAndLegacyEmitterAreMutuallyExclusive(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_ENABLED", "true")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_PANEL_URL", "https://panel.example.test")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_SECRET", "legacy-secret")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_SUB2API_INSTANCE_ID", "7")
+	t.Setenv("GATEWAY_ROUTING_ATTEMPT_EMITTER_ALLOWED_GROUP_IDS", "31")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_ENABLED", "true")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_PANEL_URL", "https://panel.example.test")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_SECRET", "observer-secret")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_SUB2API_INSTANCE_ID", "7")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_DATA_DIR", "/tmp/routing-observer-test")
+
+	_, err := Load()
+	require.ErrorContains(t, err, "cannot both be enabled")
+}
+
+func TestRoutingObserverRejectsSecretTooShortForDomainSeparatedIdentity(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_ENABLED", "true")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_PANEL_URL", "https://panel.example.test")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_SECRET", "short")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_SUB2API_INSTANCE_ID", "7")
+	t.Setenv("GATEWAY_ROUTING_OBSERVER_DATA_DIR", "/tmp/routing-observer-test")
+
+	_, err := Load()
+	require.ErrorContains(t, err, "at least 16 bytes")
+}
+
+func TestValidateRoutingObserverBounds(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*GatewayRoutingObserverConfig)
+		want      string
+	}{
+		{"queue", func(c *GatewayRoutingObserverConfig) { c.QueueSize = GatewayRoutingObserverMaxQueueSize + 1 }, "queue_size"},
+		{"request timeout", func(c *GatewayRoutingObserverConfig) { c.RequestTimeoutMS = 0 }, "request_timeout_ms"},
+		{"shutdown timeout", func(c *GatewayRoutingObserverConfig) {
+			c.ShutdownTimeoutMS = GatewayRoutingObserverMaxShutdownTimeoutMS + 1
+		}, "shutdown_timeout_ms"},
+		{"scopes", func(c *GatewayRoutingObserverConfig) { c.MaxScopes = GatewayRoutingObserverMaxScopes + 1 }, "max_scopes"},
+		{"accounts", func(c *GatewayRoutingObserverConfig) { c.MaxAccountsPerScope = 0 }, "max_accounts_per_scope"},
+		{"rules", func(c *GatewayRoutingObserverConfig) { c.MaxRulesPerPolicy = 0 }, "max_rules_per_policy"},
+		{"attempts", func(c *GatewayRoutingObserverConfig) { c.MaxAttemptsPerRequest = 0 }, "max_attempts_per_request"},
+		{"outbox", func(c *GatewayRoutingObserverConfig) { c.MaxPendingOutbox = 0 }, "max_pending_outbox"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resetViperWithJWTSecret(t)
+			cfg, err := Load()
+			require.NoError(t, err)
+			test.configure(&cfg.Gateway.RoutingObserver)
+			require.ErrorContains(t, cfg.Validate(), test.want)
+		})
+	}
+}
+
 func TestNormalizeForwardedClientIPHeaders(t *testing.T) {
 	headers, err := NormalizeForwardedClientIPHeaders([]string{
 		" x-cdn-client-ip ",
@@ -724,6 +881,7 @@ func TestLoadIdempotencyConfigFromEnv(t *testing.T) {
 func TestLoadSchedulingConfigFromEnv(t *testing.T) {
 	resetViperWithJWTSecret(t)
 	t.Setenv("GATEWAY_SCHEDULING_STICKY_SESSION_MAX_WAITING", "5")
+	t.Setenv("GATEWAY_SCHEDULING_GROUP_SCOPED_PRIORITY_ENABLED", "true")
 
 	cfg, err := Load()
 	if err != nil {
@@ -733,6 +891,17 @@ func TestLoadSchedulingConfigFromEnv(t *testing.T) {
 	if cfg.Gateway.Scheduling.StickySessionMaxWaiting != 5 {
 		t.Fatalf("StickySessionMaxWaiting = %d, want 5", cfg.Gateway.Scheduling.StickySessionMaxWaiting)
 	}
+	if !cfg.Gateway.Scheduling.GroupScopedPriorityEnabled {
+		t.Fatal("GroupScopedPriorityEnabled = false, want true")
+	}
+}
+
+func TestLoadGroupScopedPriorityDisabledByDefault(t *testing.T) {
+	resetViperWithJWTSecret(t)
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.False(t, cfg.Gateway.Scheduling.GroupScopedPriorityEnabled)
 }
 
 func TestLoadWeChatConnectConfigFromLegacyEnv(t *testing.T) {
