@@ -1,7 +1,11 @@
 name: CI
 
 on:
+  # Release tags are already validated on their exact commit by the candidate
+  # branch. Avoid running the same ten-minute CI batch again for the tag push.
   push:
+    branches:
+      - '**'
   pull_request:
 
 permissions:
@@ -21,7 +25,7 @@ jobs:
           /bin/sh deploy/tests/docker-runtime-resources-test.sh
           /bin/sh deploy/test-caddyfile-cache.sh
 
-  test:
+  unit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -37,9 +41,34 @@ jobs:
       - name: Unit tests
         working-directory: backend
         run: make test-unit
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          check-latest: false
+          cache: true
+          cache-dependency-path: backend/go.sum
+      - name: Verify Go version
+        run: |
+          go version | grep -q 'go1.27.0'
       - name: Integration tests
         working-directory: backend
         run: make test-integration
+
+  # Preserve the historical aggregate check name for external consumers while
+  # running the expensive suites concurrently above.
+  test:
+    needs: [unit, integration]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm parallel backend suites
+        run: |
+          test "${{ needs.unit.result }}" = success
+          test "${{ needs.integration.result }}" = success
 
   frontend:
     runs-on: ubuntu-latest

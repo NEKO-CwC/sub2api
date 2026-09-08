@@ -1,7 +1,11 @@
 name: Security Scan
 
 on:
+  # The candidate branch and release tag point to the same immutable commit.
+  # Scan the branch once; the tag-specific workflow only publishes the image.
   push:
+    branches:
+      - '**'
   pull_request:
   schedule:
     - cron: '0 3 * * 1'

@@ -17,11 +17,14 @@ run_go() {
     return
   fi
   command -v docker >/dev/null 2>&1 || die 'Go or Docker is required'
+  local go_version
+  go_version=$(awk '$1 == "go" { print $2; exit }' backend/go.mod)
   docker run --rm \
+    --network host \
     --volume "$repo_root:/src" \
     --workdir /src/backend \
-    golang:1.26.6-alpine \
-    sh -c "$command"
+    "golang:${go_version}-alpine" \
+    sh -c 'export PATH=/go/bin:/usr/local/go/bin:$PATH; exec sh -c "$1"' sh "$command"
 }
 
 usage() {
@@ -38,6 +41,11 @@ cd "$repo_root"
 
 [[ -z "$(git status --porcelain)" ]] || die 'working tree must be clean'
 [[ "$(git branch --show-current)" == "$stable_branch" ]] || die "run from $stable_branch"
+
+previous_upstream_tag=$(git tag --merged HEAD --list 'v[0-9]*' --sort=-v:refname \
+  | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+  | head -n 1)
+[[ -n "$previous_upstream_tag" ]] || die 'cannot identify the previous upstream release tag'
 
 if git remote get-url upstream >/dev/null 2>&1; then
   [[ "$(git remote get-url upstream)" == "$upstream_url" ]] || die 'remote upstream points to an unexpected URL'
@@ -83,7 +91,7 @@ elif git rev-parse -q --verify MERGE_HEAD >/dev/null; then
   git commit --no-edit
 fi
 
-run_go 'go test ./...'
+"$repo_root/deploy/neko-fast-gate.sh" "$previous_upstream_tag" "$upstream_tag"
 
 git switch "$stable_branch"
 git merge --ff-only "$upgrade_branch"
