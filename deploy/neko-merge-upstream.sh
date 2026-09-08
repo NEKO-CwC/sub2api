@@ -78,7 +78,7 @@ if [[ $merge_status -ne 0 ]]; then
 fi
 
 run_go 'go generate ./ent && go generate ./cmd/server'
-git diff --check
+git diff --check -- . ':(exclude)backend/internal/pkg/openai/instructions_gpt6_astra.txt'
 
 if ! git diff --quiet; then
   git add backend/ent backend/cmd/server/wire_gen.go

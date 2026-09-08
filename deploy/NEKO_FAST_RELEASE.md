@@ -76,6 +76,8 @@ Fast-path gates are intentionally small but meaningful:
 - no merge conflicts and no tracked worktree drift;
 - no obvious destructive migration statement;
 - generated Ent/Wire files match committed output;
+- executable/source diffs pass whitespace checks; the upstream Astra prompt
+  template is preserved byte-for-byte and is the sole path exception;
 - every Go package compiles;
 - NEKO routing, priority, membership, concurrency, and failure metadata tests pass;
 - deployment/Compose contract tests pass;
@@ -103,6 +105,10 @@ Stop the fast path without deploying when any of these occurs:
 
 Investigation time is reported separately. A release that exits the fast path
 has not missed the SLO; it has correctly declined the routine-release route.
+
+`git merge-tree` output is advisory only. Older Git versions indent conflict
+markers, so the actual `git merge` exit status and `git diff --diff-filter=U`
+are the authoritative conflict gate.
 
 ## Existing production transaction contract
 

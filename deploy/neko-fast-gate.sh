@@ -59,7 +59,10 @@ if git diff --unified=0 "$previous_tag..$target_tag" -- 'backend/migrations/*.sq
   die 'potentially destructive upstream migration requires the slow path'
 fi
 
-git diff --check
+# Preserve upstream instruction templates byte-for-byte; Markdown prompt text
+# may carry trailing spaces intentionally. All executable/source files remain
+# under the whitespace gate.
+git diff --check -- . ':(exclude)backend/internal/pkg/openai/instructions_gpt6_astra.txt'
 /bin/bash -n deploy/apple-container.sh
 /bin/bash -n deploy/tests/apple-container-test.sh
 /bin/bash -n deploy/neko-merge-upstream.sh
@@ -79,7 +82,7 @@ git diff --exit-code -- backend/ent backend/cmd/server/wire_gen.go
 # Compile every default package, then run only the contracts maintained by the
 # NEKO fork. The full unit/integration suites remain required in parallel CI.
 run_go go test -run '^$' ./...
-readonly focused='Routing|GroupAccountPriority|SchedulerMembership|ConcurrencyHandoff|FailureMetadata|AccountConcurrencyConfirmation|BindGroups'
+readonly focused='Routing|GroupAccountPriority|SchedulerMembership|ConcurrencyHandoff|FailureMetadata|AccountConcurrencyConfirmation|BindGroups|ModelNotAllowed|AllowlistedModel|Duplicate.*Model|CaseVariantModel|SessionUpdate'
 run_go go test -count=1 ./cmd/server ./internal/handler ./internal/repository ./internal/service ./internal/server/routes -run "$focused"
 run_go go test -count=1 -tags=unit ./internal/config ./internal/handler/admin ./internal/service -run "$focused"
 run_go go test -count=1 -tags=integration ./internal/repository -run "$focused"
