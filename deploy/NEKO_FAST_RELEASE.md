@@ -61,8 +61,9 @@ Do these before starting the ten-minute clock:
 
 The CI workflow splits unit and integration tests into separate jobs. From the
 recorded run, that reduces the test critical path from about 10m 10s to about
-6m 32s plus setup. CI and security workflows run on branch pushes only, so a
-release tag no longer launches a duplicate full validation batch.
+6m 32s plus setup. CI and security workflows run on candidate release branch
+pushes; stable promotion and upgrade branch pointer moves are ignored, and a
+release tag does not launch a duplicate full validation batch.
 
 The tag can be published while candidate CI is running so the image build runs
 in parallel. A failing gate consumes that immutable NEKO version; fix the

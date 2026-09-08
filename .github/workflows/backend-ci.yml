@@ -1,11 +1,13 @@
 name: CI
 
 on:
-  # Release tags are already validated on their exact commit by the candidate
-  # branch. Avoid running the same ten-minute CI batch again for the tag push.
+  # Candidate release branches run the full validation once. Stable promotion
+  # and upgrade branches are pointer moves after that validation and must not
+  # start a duplicate seven-minute test batch; PRs still validate all changes.
   push:
-    branches:
-      - '**'
+    branches-ignore:
+      - 'neko/stable'
+      - 'upgrade/**'
   pull_request:
 
 permissions:
