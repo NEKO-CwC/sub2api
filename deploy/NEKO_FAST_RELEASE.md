@@ -48,11 +48,16 @@ Do these before starting the ten-minute clock:
 5. Confirm the previous production release receipt and its rollback directory
    still exist.
 
+An upstream release may be a formal tag or a pinned 40-character commit when
+`upstream/main` has moved ahead of the latest tag. The exact commit must be
+recorded in the candidate receipt and used consistently for merge, gate, image
+labels, and postflight identity.
+
 ## Ten-minute path
 
 | Budget | Operation | Required evidence |
 | --- | --- | --- |
-| 0:00-1:30 | Run `deploy/neko-merge-upstream.sh vX.Y.Z` | Clean merge, additive-migration scan, codegen parity, all-package compile, focused NEKO tests, Compose checks |
+| 0:00-1:30 | Run `deploy/neko-merge-upstream.sh vX.Y.Z_OR_COMMIT` | Clean merge, migration scan, codegen parity, all-package compile, focused NEKO tests, Compose checks |
 | 1:30 | Create immutable `vX.Y.Z-neko.N`; push the candidate branch and tag together | Candidate branch and annotated tag resolve to the same SHA |
 | 1:30-8:00 | Run candidate CI, security scan, and tag image build concurrently | All three successful on the same SHA; GHCR RepoDigest and OCI revision match |
 | 1:30-3:00 | In parallel, freeze production preimage and create the PostgreSQL/config backup | Current service healthy/restart 0; hashes recorded; PG 18 archive list and full decode pass |
@@ -75,7 +80,7 @@ Fast-path gates are intentionally small but meaningful:
 
 - upstream tag and candidate commit identities are exact;
 - no merge conflicts and no tracked worktree drift;
-- no obvious destructive migration statement;
+- no unreviewed destructive migration statement;
 - generated Ent/Wire files match committed output;
 - executable/source diffs pass whitespace checks; the upstream Astra prompt
   template is preserved byte-for-byte and is the sole path exception;
@@ -94,8 +99,8 @@ Stop the fast path without deploying when any of these occurs:
 
 - Tailscale authentication is incomplete when the timed run starts;
 - a real merge conflict appears;
-- migration changes include data deletion, table/column deletion, truncation,
-  or a column type rewrite;
+- migration changes include unreviewed data deletion, table/column deletion,
+  truncation, or a column type rewrite;
 - code generation changes files unexpectedly;
 - any focused or GitHub gate fails;
 - the expected image is not ready by minute eight;
@@ -110,6 +115,23 @@ has not missed the SLO; it has correctly declined the routine-release route.
 `git merge-tree` output is advisory only. Older Git versions indent conflict
 markers, so the actual `git merge` exit status and `git diff --diff-filter=U`
 are the authoritative conflict gate.
+
+## Reviewed migration exception
+
+The fast gate has one explicit, content-pinned cleanup exception:
+
+```text
+backend/migrations/238_purge_unlimited_user_platform_quotas.sql
+SHA-256 2ea9aea4b152531184b14559dc413ad2c33eadc9985b49ff90c579b3e1f1592e
+```
+
+It removes rows whose daily, weekly, and monthly limits are all `NULL`, because
+the application treats an absent row as unlimited. Before deploying a candidate
+that contains this exception, record a read-only production inventory of active
+and soft-deleted matching rows plus their aggregate usage, validate the normal
+PostgreSQL backup, and retain the deployment receipt. Any change to the file
+content, any other destructive migration, or an inventory/backup failure exits
+the fast path.
 
 ## Existing production transaction contract
 

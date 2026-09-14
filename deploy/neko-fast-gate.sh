@@ -9,22 +9,22 @@ die() {
 }
 
 usage() {
-  printf 'usage: %s PREVIOUS_UPSTREAM_TAG TARGET_UPSTREAM_TAG\n' "${0##*/}" >&2
+  printf 'usage: %s PREVIOUS_UPSTREAM_TAG TARGET_UPSTREAM_TAG_OR_COMMIT\n' "${0##*/}" >&2
   exit 2
 }
 
 [[ $# -eq 2 ]] || usage
 readonly previous_tag=$1
-readonly target_tag=$2
+readonly target_ref=$2
 [[ $previous_tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || usage
-[[ $target_tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || usage
+[[ $target_ref =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ || $target_ref =~ ^[0-9a-f]{40}$ ]] || usage
 
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || die 'not inside a Git repository'
 cd "$repo_root"
 [[ -z $(git status --porcelain) ]] || die 'working tree must be clean'
 git rev-parse --verify "$previous_tag^{commit}" >/dev/null
-git rev-parse --verify "$target_tag^{commit}" >/dev/null
-git merge-base --is-ancestor "$target_tag^{commit}" HEAD || die "$target_tag is not merged into HEAD"
+git rev-parse --verify "$target_ref^{commit}" >/dev/null
+git merge-base --is-ancestor "$target_ref^{commit}" HEAD || die "$target_ref is not merged into HEAD"
 
 readonly started_at=$SECONDS
 readonly budget_seconds=${NEKO_FAST_GATE_BUDGET_SECONDS:-$default_budget_seconds}
@@ -48,16 +48,27 @@ run_go() {
 }
 
 printf 'fast_gate: previous=%s target=%s candidate=%s go=%s\n' \
-  "$previous_tag" "$target_tag" "$(git rev-parse HEAD)" "$go_version"
+  "$previous_tag" "$target_ref" "$(git rev-parse HEAD)" "$go_version"
 
-# Fast path permits additive migrations. Data deletion and table/column type
-# rewrites need the slower migration review before a release tag is created.
-if git diff --unified=0 "$previous_tag..$target_tag" -- 'backend/migrations/*.sql' \
-  | sed -n '/^+[^+]/p' \
-  | sed '/^+[[:space:]]*--/d' \
-  | grep -Eiq 'DROP[[:space:]]+(TABLE|COLUMN)|TRUNCATE([[:space:]]|$)|DELETE[[:space:]]+FROM|ALTER[[:space:]].*ALTER[[:space:]]+COLUMN.*TYPE'; then
-  die 'potentially destructive upstream migration requires the slow path'
-fi
+# Fast path permits additive migrations. One reviewed cleanup is explicitly
+# allowlisted by path and content; every other data deletion or schema rewrite
+# still requires the slow path.
+readonly approved_migration_path='backend/migrations/238_purge_unlimited_user_platform_quotas.sql'
+readonly approved_migration_sha256='2ea9aea4b152531184b14559dc413ad2c33eadc9985b49ff90c579b3e1f1592e'
+while IFS= read -r migration_path; do
+  [[ -n "$migration_path" ]] || continue
+  if git diff --unified=0 "$previous_tag..$target_ref" -- "$migration_path" \
+    | sed -n '/^+[^+]/p' \
+    | sed '/^+[[:space:]]*--/d' \
+    | grep -Eiq 'DROP[[:space:]]+(TABLE|COLUMN)|TRUNCATE([[:space:]]|$)|DELETE[[:space:]]+FROM|ALTER[[:space:]].*ALTER[[:space:]]+COLUMN.*TYPE'; then
+    if [[ "$migration_path" != "$approved_migration_path" ]]; then
+      die "unapproved destructive migration requires the slow path: $migration_path"
+    fi
+    actual_sha256=$(git show "$target_ref:$migration_path" | sha256sum | awk '{print $1}')
+    [[ "$actual_sha256" == "$approved_migration_sha256" ]] || \
+      die "approved migration content changed: $migration_path"
+  fi
+done < <(git diff --name-only "$previous_tag..$target_ref" -- 'backend/migrations/*.sql')
 
 # Preserve upstream instruction templates byte-for-byte; Markdown prompt text
 # may carry trailing spaces intentionally. All executable/source files remain
@@ -87,7 +98,7 @@ run_go go test -count=1 ./cmd/server ./internal/handler ./internal/repository ./
 run_go go test -count=1 -tags=unit ./internal/config ./internal/handler/admin ./internal/service -run "$focused"
 run_go go test -count=1 -tags=integration ./internal/repository -run "$focused"
 
-if ! git diff --quiet "$previous_tag..$target_tag" -- frontend/package.json frontend/pnpm-lock.yaml; then
+if ! git diff --quiet "$previous_tag..$target_ref" -- frontend/package.json frontend/pnpm-lock.yaml; then
   npx --yes pnpm@9.15.9 --dir frontend install --frozen-lockfile --lockfile-only
   git diff --exit-code -- frontend/pnpm-lock.yaml
 fi

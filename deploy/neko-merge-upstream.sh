@@ -28,13 +28,13 @@ run_go() {
 }
 
 usage() {
-  printf 'usage: %s vX.Y.Z\n' "${0##*/}" >&2
+  printf 'usage: %s vX.Y.Z_OR_COMMIT\n' "${0##*/}" >&2
   exit 2
 }
 
 [[ $# -eq 1 ]] || usage
-readonly upstream_tag=$1
-[[ "$upstream_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || usage
+readonly upstream_ref=$1
+[[ "$upstream_ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ || "$upstream_ref" =~ ^[0-9a-f]{40}$ ]] || usage
 
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || die 'not inside a Git repository'
 cd "$repo_root"
@@ -53,15 +53,23 @@ else
   git remote add upstream "$upstream_url"
 fi
 
-git fetch --no-tags upstream "refs/tags/$upstream_tag:refs/tags/$upstream_tag"
-git rev-parse --verify "$upstream_tag^{commit}" >/dev/null
+if [[ "$upstream_ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  git fetch --no-tags upstream "refs/tags/$upstream_ref:refs/tags/$upstream_ref"
+else
+  git fetch --no-tags upstream "$upstream_ref"
+fi
+git rev-parse --verify "$upstream_ref^{commit}" >/dev/null
 
-readonly upgrade_branch="upgrade/${upstream_tag#v}"
+if [[ "$upstream_ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  readonly upgrade_branch="upgrade/${upstream_ref#v}"
+else
+  readonly upgrade_branch="upgrade/upstream-${upstream_ref:0:12}"
+fi
 git show-ref --verify --quiet "refs/heads/$upgrade_branch" && die "branch $upgrade_branch already exists"
 git switch -c "$upgrade_branch"
 
 set +e
-git merge --no-ff --no-edit "$upstream_tag"
+git merge --no-ff --no-edit "$upstream_ref"
 merge_status=$?
 set -e
 
@@ -85,16 +93,16 @@ if ! git diff --quiet; then
   if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
     git commit --no-edit
   else
-    git commit -m "chore: regenerate code after merging $upstream_tag"
+    git commit -m "chore: regenerate code after merging $upstream_ref"
   fi
 elif git rev-parse -q --verify MERGE_HEAD >/dev/null; then
   git commit --no-edit
 fi
 
-"$repo_root/deploy/neko-fast-gate.sh" "$previous_upstream_tag" "$upstream_tag"
+"$repo_root/deploy/neko-fast-gate.sh" "$previous_upstream_tag" "$upstream_ref"
 
 git switch "$stable_branch"
 git merge --ff-only "$upgrade_branch"
 
-printf 'merged %s into %s\n' "$upstream_tag" "$stable_branch"
+printf 'merged %s into %s\n' "$upstream_ref" "$stable_branch"
 printf 'next: git push origin %s\n' "$stable_branch"
