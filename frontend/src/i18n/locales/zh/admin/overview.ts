@@ -1175,7 +1175,10 @@ export default {
         searchEmpty: '未找到匹配账号',
         fallback: '选定账号全部不可用时回退调度器',
         fallbackHint: '关闭时返回 503 / 上游错误；开启时回退到现有调度器选账路径。',
-        selectAtLeastOne: '开启固定账号后至少选择一个账号'
+        selectAtLeastOne: '开启固定账号后至少选择一个账号',
+        legacyBaseInstructions: '兼容旧版 Codex 模型目录',
+        legacyBaseInstructionsHint:
+          '把 model_messages.instructions_template 同步输出到顶层 base_instructions。部分第三方客户端（如 Magpie）只读取旧字段，缺少时会把原生 Codex 提示词降级为内置旧版本。默认关闭。'
       },
       compositeRoutes: {
         action: '路由',

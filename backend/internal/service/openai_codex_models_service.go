@@ -163,6 +163,9 @@ func (s *OpenAIGatewayService) BuildGroupConfiguredCodexModelsManifest(
 		Body: body,
 		ETag: codexModelsManifestBodyETag(body),
 	}
+	if err := s.applyCodexModelsManifestCompatibility(group, manifest); err != nil {
+		return nil, false, fmt.Errorf("apply Codex models manifest compatibility: %w", err)
+	}
 	if codexModelsManifestETagMatches(ifNoneMatch, manifest.ETag) {
 		manifest.Body = nil
 		manifest.NotModified = true
@@ -219,6 +222,11 @@ func (s *OpenAIGatewayService) MergeGroupConfiguredCodexModels(
 	if changed || retired {
 		manifest.Body = body
 		manifest.ETag = codexModelsManifestBodyETag(body)
+	}
+	// Legacy field compatibility must run on the final body, before the client
+	// ETag comparison, so a 304 can never describe a pre-completion body.
+	if err := s.applyCodexModelsManifestCompatibility(group, manifest); err != nil {
+		return fmt.Errorf("apply Codex models manifest compatibility: %w", err)
 	}
 	if codexModelsManifestETagMatches(ifNoneMatch, manifest.ETag) {
 		manifest.Body = nil
@@ -1363,6 +1371,155 @@ func isOfficialGrokCodexBaseURL(raw string) bool {
 // callers that still use the provider-specific function name.
 func BuildDeepSeekCodexModelsManifest(modelIDs []string) ([]byte, error) {
 	return BuildCodexModelsManifest(modelIDs)
+}
+
+// codexModelJSONFieldBaseInstructions is the legacy top-level field still read
+// by third-party Codex clients (for example Magpie) when they decide whether an
+// upstream entry carries native Codex metadata. Current Codex builds serialize
+// the same text under model_messages.instructions_template.
+const codexModelJSONFieldBaseInstructions = "base_instructions"
+
+// emitLegacyBaseInstructions keeps the legacy Codex catalog field in sync with
+// model_messages.instructions_template for groups that opt in.
+//
+// The transformation is deliberately conservative:
+//   - an existing non-empty base_instructions is never overwritten or rewritten;
+//   - the copied value is the template bytes verbatim, never parsed or trimmed;
+//   - entries with neither field are left untouched and never receive a
+//     synthesized prompt;
+//   - conflicting non-empty values are reported instead of silently resolved;
+//   - no other model metadata field is changed.
+//
+// It returns changed=false together with the original body when nothing needed
+// completing, so callers can keep the pre-existing ETag and 304 behavior.
+func emitLegacyBaseInstructions(body []byte) ([]byte, bool, error) {
+	if len(body) == 0 {
+		return body, false, nil
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, false, fmt.Errorf("decode Codex models manifest: %w", err)
+	}
+	rawModels, ok := envelope["models"]
+	if !ok {
+		return body, false, nil
+	}
+	var models []json.RawMessage
+	if err := json.Unmarshal(rawModels, &models); err != nil {
+		return nil, false, fmt.Errorf("decode Codex models manifest entries: %w", err)
+	}
+
+	changed := false
+	for index, rawModel := range models {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(rawModel, &fields); err != nil || fields == nil {
+			continue
+		}
+		template, err := codexModelInstructionsTemplate(fields)
+		if err != nil {
+			return nil, false, err
+		}
+		if template == "" {
+			continue
+		}
+		existing, err := codexJSONStringField(fields, codexModelJSONFieldBaseInstructions)
+		if err != nil {
+			return nil, false, err
+		}
+		switch {
+		case existing == template:
+			continue
+		case existing != "":
+			return nil, false, fmt.Errorf(
+				"Codex models manifest entry %d declares conflicting base_instructions and model_messages.instructions_template",
+				index,
+			)
+		}
+		encoded, err := json.Marshal(template)
+		if err != nil {
+			return nil, false, err
+		}
+		fields[codexModelJSONFieldBaseInstructions] = encoded
+		updated, err := json.Marshal(fields)
+		if err != nil {
+			return nil, false, err
+		}
+		models[index] = updated
+		changed = true
+	}
+	if !changed {
+		return body, false, nil
+	}
+
+	encodedModels, err := json.Marshal(models)
+	if err != nil {
+		return nil, false, err
+	}
+	envelope["models"] = encodedModels
+	completed, err := json.Marshal(envelope)
+	if err != nil {
+		return nil, false, err
+	}
+	return completed, true, nil
+}
+
+// codexModelInstructionsTemplate extracts model_messages.instructions_template
+// as a non-empty string, or "" when the entry does not carry one.
+func codexModelInstructionsTemplate(fields map[string]json.RawMessage) (string, error) {
+	rawMessages, ok := fields["model_messages"]
+	if !ok || len(bytes.TrimSpace(rawMessages)) == 0 {
+		return "", nil
+	}
+	var messages map[string]json.RawMessage
+	if err := json.Unmarshal(rawMessages, &messages); err != nil || messages == nil {
+		return "", nil
+	}
+	return codexJSONStringField(messages, "instructions_template")
+}
+
+// codexJSONStringField decodes a string field, treating absent, null and empty
+// values uniformly as "". A non-string value is an error: guessing would mean
+// rewriting metadata the caller never asked to change.
+func codexJSONStringField(fields map[string]json.RawMessage, key string) (string, error) {
+	raw, ok := fields[key]
+	if !ok {
+		return "", nil
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return "", nil
+	}
+	var value string
+	if err := json.Unmarshal(trimmed, &value); err != nil {
+		return "", fmt.Errorf("decode Codex models manifest field %q: %w", key, err)
+	}
+	return value, nil
+}
+
+// applyCodexModelsManifestCompatibility applies the group-scoped legacy field
+// compatibility pass to a finished manifest and re-derives its ETag.
+//
+// Every Codex manifest response path must run this after the body is final
+// (including merged group aliases and retired-model filtering) and before any
+// If-None-Match comparison, otherwise a client could cache an ETag that does
+// not describe the completed body.
+func (s *OpenAIGatewayService) applyCodexModelsManifestCompatibility(group *Group, manifest *OpenAIModelsResponse) error {
+	if manifest == nil || group == nil || manifest.NotModified || len(manifest.Body) == 0 {
+		return nil
+	}
+	if !group.CodexModelsManifestConfig.EmitLegacyBaseInstructions {
+		return nil
+	}
+	completed, changed, err := emitLegacyBaseInstructions(manifest.Body)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	manifest.Body = completed
+	manifest.ETag = codexModelsManifestBodyETag(completed)
+	return nil
 }
 
 func mergeConfiguredCodexModelsManifest(

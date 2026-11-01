@@ -122,6 +122,29 @@
     <p v-else class="text-xs text-gray-500 dark:text-gray-400">
       {{ t("admin.groups.codexModelsManifest.disabledHint") }}
     </p>
+
+    <!--
+      独立于「固定账号获取模型列表」：兼容字段只影响最终 manifest 的序列化，
+      两条路径（本地生成 / 固定账号 / 调度器）都需要它。
+    -->
+    <div
+      class="mt-3 flex items-start justify-between gap-3 border-t border-gray-200 pt-3 dark:border-dark-400"
+    >
+      <div class="min-w-0 flex-1">
+        <label class="text-sm text-gray-700 dark:text-gray-300">
+          {{ t("admin.groups.codexModelsManifest.legacyBaseInstructions") }}
+        </label>
+        <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+          {{ t("admin.groups.codexModelsManifest.legacyBaseInstructionsHint") }}
+        </p>
+      </div>
+      <Toggle
+        data-testid="codex-manifest-legacy-base-instructions-toggle"
+        :aria-label="t('admin.groups.codexModelsManifest.legacyBaseInstructions')"
+        :model-value="config.emit_legacy_base_instructions === true"
+        @update:model-value="emitUpdate({ emit_legacy_base_instructions: $event })"
+      />
+    </div>
   </div>
 </template>
 

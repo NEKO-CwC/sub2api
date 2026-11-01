@@ -4930,6 +4930,7 @@ const createCodexManifestDefaults = (): CodexModelsManifestConfig => ({
   enabled: false,
   account_ids: [],
   fallback_to_scheduler: false,
+  emit_legacy_base_instructions: false,
 });
 const editCodexManifestConfig = ref<CodexModelsManifestConfig>(createCodexManifestDefaults());
 const editCodexManifestAccountNames = ref<Record<number, string>>({});
@@ -6200,6 +6201,8 @@ const handleEdit = async (group: AdminGroup) => {
     enabled: savedCodexManifestConfig.enabled ?? false,
     account_ids: [...(savedCodexManifestConfig.account_ids ?? [])],
     fallback_to_scheduler: savedCodexManifestConfig.fallback_to_scheduler ?? false,
+    emit_legacy_base_instructions:
+      savedCodexManifestConfig.emit_legacy_base_instructions ?? false,
   };
   editCodexManifestAccountNames.value = {};
   for (const id of editCodexManifestConfig.value.account_ids) {
@@ -6348,6 +6351,8 @@ const handleUpdateGroup = async () => {
               enabled: editCodexManifestConfig.value.enabled,
               account_ids: [...editCodexManifestConfig.value.account_ids],
               fallback_to_scheduler: editCodexManifestConfig.value.fallback_to_scheduler,
+              emit_legacy_base_instructions:
+                editCodexManifestConfig.value.emit_legacy_base_instructions,
             }
           : createCodexManifestDefaults(),
       supported_model_scopes: normalizeSupportedModelScopesForPlatform(

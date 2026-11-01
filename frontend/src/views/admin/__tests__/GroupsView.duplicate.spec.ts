@@ -434,7 +434,8 @@ describe('GroupsView duplicate action', () => {
       await flushPromises()
       expect(updateGroup).toHaveBeenCalledWith(42, expect.objectContaining({
         codex_models_manifest_config: {
-          enabled: true, account_ids: [5], fallback_to_scheduler: true
+          enabled: true, account_ids: [5], fallback_to_scheduler: true,
+          emit_legacy_base_instructions: false
         }
       }))
 

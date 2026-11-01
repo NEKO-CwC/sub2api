@@ -26,12 +26,14 @@ const disabledConfig = (): CodexModelsManifestConfig => ({
   enabled: false,
   account_ids: [],
   fallback_to_scheduler: false,
+  emit_legacy_base_instructions: false,
 });
 
 const enabledConfig = (): CodexModelsManifestConfig => ({
   enabled: true,
   account_ids: [],
   fallback_to_scheduler: false,
+  emit_legacy_base_instructions: false,
 });
 
 // 挂载一个 v-model 双向绑定的宿主，验证完整的选择→移除流程。
@@ -207,6 +209,35 @@ describe("CodexManifestAccountsField", () => {
     await search.trigger("click");
     await search.trigger("focus");
     expect(wrapper.find('[data-testid="codex-manifest-dropdown"]').exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  // 兼容开关独立于「固定账号获取模型列表」：关闭固定账号时也必须可见可改，
+  // 因为本地生成与调度器两条路径同样需要补齐旧字段。
+  it("exposes the legacy base instructions toggle independently of pinned accounts", async () => {
+    const wrapper = mountInteractive(disabledConfig());
+
+    const toggle = wrapper.get(
+      '[data-testid="codex-manifest-legacy-base-instructions-toggle"]',
+    );
+    expect(toggle.attributes("aria-checked")).toBe("false");
+
+    await toggle.trigger("click");
+    await flushPromises();
+    expect(
+      wrapper
+        .get('[data-testid="codex-manifest-legacy-base-instructions-toggle"]')
+        .attributes("aria-checked"),
+    ).toBe("true");
+
+    const emitted = wrapper
+      .findComponent(CodexManifestAccountsField)
+      .emitted("update:modelValue") as Array<[CodexModelsManifestConfig]>;
+    expect(emitted.at(-1)?.[0]).toMatchObject({
+      enabled: false,
+      emit_legacy_base_instructions: true,
+    });
+
     wrapper.unmount();
   });
 });

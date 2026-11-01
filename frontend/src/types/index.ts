@@ -684,6 +684,8 @@ export interface CodexModelsManifestConfig {
   enabled: boolean
   account_ids: number[]
   fallback_to_scheduler: boolean
+  /** 兼容旧版 Codex 模型目录：把 instructions_template 同步到顶层 base_instructions */
+  emit_legacy_base_instructions?: boolean
 }
 
 export type CompositeRouteMatchType = 'exact' | 'prefix'

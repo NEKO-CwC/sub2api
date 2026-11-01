@@ -1178,7 +1178,10 @@ export default {
         searchEmpty: 'No matching accounts',
         fallback: 'Fall back to the scheduler when all pinned accounts are unavailable',
         fallbackHint: 'Off: return 503 / the upstream error. On: fall back to the existing scheduler path.',
-        selectAtLeastOne: 'Select at least one account after enabling pinned accounts'
+        selectAtLeastOne: 'Select at least one account after enabling pinned accounts',
+        legacyBaseInstructions: 'Legacy Codex catalog compatibility',
+        legacyBaseInstructionsHint:
+          'Mirrors model_messages.instructions_template into the top-level base_instructions. Some third-party clients (for example Magpie) only read the legacy field and fall back to a built-in older prompt without it. Off by default.'
       },
       compositeRoutes: {
         action: 'Routes',

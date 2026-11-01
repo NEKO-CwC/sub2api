@@ -128,6 +128,7 @@ const sourceGroup = {
     enabled: false,
     account_ids: [],
     fallback_to_scheduler: false,
+    emit_legacy_base_instructions: false,
   },
   sort_order: 10,
 } satisfies AdminGroup;
@@ -280,6 +281,7 @@ describe("GroupsView Codex manifest binding", () => {
         enabled: true,
         account_ids: [17],
         fallback_to_scheduler: false,
+        emit_legacy_base_instructions: false,
       }),
     );
 

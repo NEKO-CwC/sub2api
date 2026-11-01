@@ -23,8 +23,9 @@ func normalizeCodexModelsManifestConfig(platform string, cfg GroupCodexModelsMan
 		return GroupCodexModelsManifestConfig{}
 	}
 	out := GroupCodexModelsManifestConfig{
-		Enabled:             cfg.Enabled,
-		FallbackToScheduler: cfg.FallbackToScheduler,
+		Enabled:                    cfg.Enabled,
+		FallbackToScheduler:        cfg.FallbackToScheduler,
+		EmitLegacyBaseInstructions: cfg.EmitLegacyBaseInstructions,
 	}
 	if len(cfg.AccountIDs) == 0 {
 		return out
