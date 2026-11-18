@@ -1453,7 +1453,7 @@ func emitLegacyBaseInstructions(body []byte) ([]byte, bool, error) {
 			continue
 		case existing != "":
 			return nil, false, fmt.Errorf(
-				"Codex models manifest entry %d declares conflicting base_instructions and model_messages.instructions_template",
+				"codex models manifest entry %d declares conflicting base_instructions and model_messages.instructions_template",
 				index,
 			)
 		}
