@@ -13,8 +13,8 @@ import (
 // so byte-identical copying is observable.
 func codexManifestWithTemplate(slug, template string) map[string]any {
 	return map[string]any{
-		"slug":         slug,
-		"display_name": slug,
+		"slug":           slug,
+		"display_name":   slug,
 		"context_window": 272000,
 		"model_messages": map[string]any{
 			"instructions_template": template,
@@ -28,7 +28,6 @@ func encodeCodexManifest(t *testing.T, models ...map[string]any) []byte {
 	require.NoError(t, err)
 	return body
 }
-
 
 func TestEmitLegacyBaseInstructionsCopiesTemplateVerbatim(t *testing.T) {
 	template := "  You are Codex, an agent based on GPT-6.\n\tTrailing space kept \n"
